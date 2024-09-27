@@ -2283,7 +2283,6 @@ static const struct attribute_group *pkey_attr_groups[] = {
 static const struct file_operations pkey_fops = {
 	.owner		= THIS_MODULE,
 	.open		= nonseekable_open,
-	.llseek		= no_llseek,
 	.unlocked_ioctl = pkey_unlocked_ioctl,
 };
 
