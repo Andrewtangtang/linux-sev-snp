@@ -28,6 +28,7 @@
  * small pkts.
  */
 #define VHOST_VSOCK_PKT_WEIGHT 256
+#define VHOST_VSOCK_PKT_WINDOW_SIZE 16
 
 enum {
 	VHOST_VSOCK_FEATURES = VHOST_FEATURES |
@@ -86,14 +87,109 @@ static struct vhost_vsock *vhost_vsock_get(u32 guest_cid)
 	return NULL;
 }
 
+static int fill_payload_to_iov_iter(struct vhost_vsock *vsock,
+				    struct vhost_virtqueue *vq,
+				    struct sk_buff *skb,
+				    struct iov_iter *iov_iter,
+				    size_t iov_len,
+				    size_t *total_flow_len,
+				    bool *restart_tx)
+{
+	struct vhost_virtqueue *tx_vq = &vsock->vqs[VSOCK_VQ_TX];
+	struct virtio_vsock_hdr *hdr;
+	u32 flags_to_restore = 0;
+	size_t payload_len;
+	u32 offset;
+	int ret;
+
+	offset = VIRTIO_VSOCK_SKB_CB(skb)->offset;
+	payload_len = skb->len - offset;
+	hdr = virtio_vsock_hdr(skb);
+
+	/* If the packet is greater than the space available in the
+	 * buffer, we split it using multiple buffers.
+	 */
+	if (payload_len > iov_len - *total_flow_len - sizeof(*hdr)) {
+		payload_len = iov_len - *total_flow_len - sizeof(*hdr);
+
+		/* As we are copying pieces of large packet's buffer to
+		 * small rx buffers, headers of packets in rx queue are
+		 * created dynamically and are initialized with header
+		 * of current packet(except length). But in case of
+		 * SOCK_SEQPACKET, we also must clear message delimeter
+		 * bit (VIRTIO_VSOCK_SEQ_EOM) and MSG_EOR bit
+		 * (VIRTIO_VSOCK_SEQ_EOR) if set. Otherwise,
+		 * there will be sequence of packets with these
+		 * bits set. After initialized header will be copied to
+		 * rx buffer, these required bits will be restored.
+		 */
+		if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOM) {
+			hdr->flags &= ~cpu_to_le32(VIRTIO_VSOCK_SEQ_EOM);
+			flags_to_restore |= VIRTIO_VSOCK_SEQ_EOM;
+
+			if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOR) {
+				hdr->flags &= ~cpu_to_le32(VIRTIO_VSOCK_SEQ_EOR);
+				flags_to_restore |= VIRTIO_VSOCK_SEQ_EOR;
+			}
+		}
+	}
+
+	if ((ret = skb_copy_datagram_iter(skb,
+					  offset,
+					  iov_iter,
+					  payload_len))) {
+		kfree_skb(skb);
+		vq_err(vq, "Faulted on copying pkt buf\n");
+		return -1;
+	}
+
+	/* Deliver to monitoring devices all packets that we
+	 * will transmit.
+	 */
+	virtio_transport_deliver_tap_pkt(skb);
+
+	VIRTIO_VSOCK_SKB_CB(skb)->offset += payload_len;
+	*total_flow_len += payload_len;
+
+	/* If we didn't send all the payload we can requeue the packet
+	 * to send it with the next available buffer.
+	 */
+	if (VIRTIO_VSOCK_SKB_CB(skb)->offset < skb->len) {
+		hdr->flags |= cpu_to_le32(flags_to_restore);
+
+		/* We are queueing the same skb to handle
+		 * the remaining bytes, and we want to deliver it
+		 * to monitoring devices in the next iteration.
+		 */
+		virtio_vsock_skb_clear_tap_delivered(skb);
+		virtio_vsock_skb_queue_head(&vsock->send_pkt_queue, skb);
+	} else {
+		if (virtio_vsock_skb_reply(skb)) {
+			int val;
+
+			val = atomic_dec_return(&vsock->queued_replies);
+
+			/* Do we have resources to resume tx
+			 * processing?
+			 */
+			if (val + 1 == tx_vq->num)
+				*restart_tx = true;
+		}
+
+		virtio_transport_consume_skb_sent(skb, true);
+	}
+	return 0;
+}
+
 static void
 vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			    struct vhost_virtqueue *vq)
 {
 	struct vhost_virtqueue *tx_vq = &vsock->vqs[VSOCK_VQ_TX];
 	int pkts = 0, total_len = 0;
-	bool added = false;
 	bool restart_tx = false;
+	bool queue_is_empty = false;
+	bool added = false;
 
 	mutex_lock(&vq->mutex);
 
@@ -107,32 +203,29 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 	vhost_disable_notify(&vsock->dev, vq);
 
 	do {
-		struct virtio_vsock_hdr *hdr;
-		size_t iov_len, payload_len;
+		struct virtio_vsock_hdr *hdr, flow_hdr;
+		size_t iov_len, total_flow_len = 0;
 		struct iov_iter iov_iter;
-		u32 flags_to_restore = 0;
+		unsigned out, in, cnt = 0;
+		bool is_first = true;
 		struct sk_buff *skb;
-		unsigned out, in;
 		size_t nbytes;
-		u32 offset;
+		int fill_err;
 		int head;
+		queue_is_empty = false;
 
-		skb = virtio_vsock_skb_dequeue(&vsock->send_pkt_queue);
-
-		if (!skb) {
-			vhost_enable_notify(&vsock->dev, vq);
+		if (skb_queue_empty(&vsock->send_pkt_queue)) {
+			queue_is_empty = true;
 			break;
 		}
 
 		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
 					 &out, &in, NULL, NULL);
-		if (head < 0) {
-			virtio_vsock_skb_queue_head(&vsock->send_pkt_queue, skb);
+		if (head < 0)
 			break;
-		}
+
 
 		if (head == vq->num) {
-			virtio_vsock_skb_queue_head(&vsock->send_pkt_queue, skb);
 			/* We cannot finish yet if more buffers snuck in while
 			 * re-enabling notify.
 			 */
@@ -144,113 +237,71 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 		}
 
 		if (out) {
-			kfree_skb(skb);
 			vq_err(vq, "Expected 0 output buffers, got %u\n", out);
 			break;
 		}
 
 		iov_len = iov_length(&vq->iov[out], in);
 		if (iov_len < sizeof(*hdr)) {
-			kfree_skb(skb);
 			vq_err(vq, "Buffer len [%zu] too small\n", iov_len);
 			break;
 		}
 
-		iov_iter_init(&iov_iter, ITER_DEST, &vq->iov[out], in, iov_len);
-		offset = VIRTIO_VSOCK_SKB_CB(skb)->offset;
-		payload_len = skb->len - offset;
-		hdr = virtio_vsock_hdr(skb);
-
-		/* If the packet is greater than the space available in the
-		 * buffer, we split it using multiple buffers.
-		 */
-		if (payload_len > iov_len - sizeof(*hdr)) {
-			payload_len = iov_len - sizeof(*hdr);
-
-			/* As we are copying pieces of large packet's buffer to
-			 * small rx buffers, headers of packets in rx queue are
-			 * created dynamically and are initialized with header
-			 * of current packet(except length). But in case of
-			 * SOCK_SEQPACKET, we also must clear message delimeter
-			 * bit (VIRTIO_VSOCK_SEQ_EOM) and MSG_EOR bit
-			 * (VIRTIO_VSOCK_SEQ_EOR) if set. Otherwise,
-			 * there will be sequence of packets with these
-			 * bits set. After initialized header will be copied to
-			 * rx buffer, these required bits will be restored.
-			 */
-			if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOM) {
-				hdr->flags &= ~cpu_to_le32(VIRTIO_VSOCK_SEQ_EOM);
-				flags_to_restore |= VIRTIO_VSOCK_SEQ_EOM;
-
-				if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOR) {
-					hdr->flags &= ~cpu_to_le32(VIRTIO_VSOCK_SEQ_EOR);
-					flags_to_restore |= VIRTIO_VSOCK_SEQ_EOR;
-				}
+		while (cnt++ < VHOST_VSOCK_PKT_WINDOW_SIZE &&
+		       total_flow_len + sizeof(*hdr) < iov_len) {
+			skb = virtio_vsock_skb_dequeue(&vsock->send_pkt_queue);
+			if (!skb) {
+				queue_is_empty = true;
+				break;
 			}
+			hdr = virtio_vsock_hdr(skb);
+
+			if (is_first || virtio_vsock_is_same_payload(&flow_hdr, hdr)) {
+				if (is_first) {
+					/* Preserve the space for hdr in iov_iter. Write the correct
+					 * length later.
+					 */
+					iov_iter_init(&iov_iter, ITER_DEST, &vq->iov[out], in, iov_len);
+					nbytes = copy_to_iter(hdr, sizeof(*hdr), &iov_iter);
+					if (nbytes != sizeof(*hdr)) {
+						kfree_skb(skb);
+						vq_err(vq, "Faulted on copying pkt hdr\n");
+						break;
+					}
+					memcpy(&flow_hdr, hdr, sizeof(*hdr));
+					is_first = false;
+				}
+				fill_err = fill_payload_to_iov_iter(vsock, vq,
+					skb, &iov_iter, iov_len, &total_flow_len,
+					&restart_tx);
+			} else {
+				virtio_vsock_skb_queue_head(&vsock->send_pkt_queue, skb);
+				break;
+			}
+
+			if (fill_err)
+				goto out;
 		}
 
 		/* Set the correct length in the header */
-		hdr->len = cpu_to_le32(payload_len);
-
-		nbytes = copy_to_iter(hdr, sizeof(*hdr), &iov_iter);
-		if (nbytes != sizeof(*hdr)) {
-			kfree_skb(skb);
+		flow_hdr.len = cpu_to_le32(total_flow_len);
+		iov_iter_init(&iov_iter, ITER_DEST, &vq->iov[out], in, iov_len);
+		nbytes = copy_to_iter(&flow_hdr, sizeof(flow_hdr), &iov_iter);
+		if (nbytes != sizeof(flow_hdr)) {
 			vq_err(vq, "Faulted on copying pkt hdr\n");
 			break;
 		}
 
-		if (skb_copy_datagram_iter(skb,
-					   offset,
-					   &iov_iter,
-					   payload_len)) {
-			kfree_skb(skb);
-			vq_err(vq, "Faulted on copying pkt buf\n");
-			break;
-		}
-
-		/* Deliver to monitoring devices all packets that we
-		 * will transmit.
-		 */
-		virtio_transport_deliver_tap_pkt(skb);
-
-		vhost_add_used(vq, head, sizeof(*hdr) + payload_len);
+		vhost_add_used(vq, head, sizeof(flow_hdr) + total_flow_len);
 		added = true;
 
-		VIRTIO_VSOCK_SKB_CB(skb)->offset += payload_len;
-		total_len += payload_len;
-
-		/* If we didn't send all the payload we can requeue the packet
-		 * to send it with the next available buffer.
-		 */
-		if (VIRTIO_VSOCK_SKB_CB(skb)->offset < skb->len) {
-			hdr->flags |= cpu_to_le32(flags_to_restore);
-
-			/* We are queueing the same skb to handle
-			 * the remaining bytes, and we want to deliver it
-			 * to monitoring devices in the next iteration.
-			 */
-			virtio_vsock_skb_clear_tap_delivered(skb);
-			virtio_vsock_skb_queue_head(&vsock->send_pkt_queue, skb);
-		} else {
-			if (virtio_vsock_skb_reply(skb)) {
-				int val;
-
-				val = atomic_dec_return(&vsock->queued_replies);
-
-				/* Do we have resources to resume tx
-				 * processing?
-				 */
-				if (val + 1 == tx_vq->num)
-					restart_tx = true;
-			}
-
-			virtio_transport_consume_skb_sent(skb, true);
-		}
-	} while(likely(!vhost_exceeds_weight(vq, ++pkts, total_len)));
+		total_len += total_flow_len;
+	} while(likely(!vhost_exceeds_weight(vq, ++pkts, total_len)) && !queue_is_empty);
+out:
+	if (queue_is_empty)
+		vhost_enable_notify(&vsock->dev, vq);
 	if (added)
 		vhost_signal(&vsock->dev, vq);
-
-out:
 	mutex_unlock(&vq->mutex);
 
 	if (restart_tx)
