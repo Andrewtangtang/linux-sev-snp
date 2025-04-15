@@ -1625,6 +1625,8 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 			goto free_pkt;
 		}
 	}
+	sk->sk_num = dst.svm_port;
+	sk->sk_dport = src.svm_port;
 
 	if (virtio_transport_get_type(sk) != le16_to_cpu(hdr->type)) {
 		(void)virtio_transport_reset_no_sock(t, skb);
@@ -1732,9 +1734,11 @@ EXPORT_SYMBOL_GPL(virtio_transport_purge_skbs);
 int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t recv_actor)
 {
 	struct virtio_vsock_sock *vvs = vsk->trans;
+	u32 fwd_cnt_delta, free_space;
 	struct sock *sk = sk_vsock(vsk);
 	struct virtio_vsock_hdr *hdr;
 	struct sk_buff *skb;
+	bool low_rx_bytes;
 	int off = 0;
 	int err;
 
@@ -1753,9 +1757,16 @@ int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t recv_acto
 		vvs->msg_count--;
 
 	virtio_transport_dec_rx_pkt(vvs, le32_to_cpu(hdr->len));
+
+	fwd_cnt_delta = vvs->fwd_cnt - vvs->last_fwd_cnt;
+	free_space = vvs->buf_alloc - fwd_cnt_delta;
+	low_rx_bytes = (vvs->rx_bytes <
+			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX));
 	spin_unlock_bh(&vvs->rx_lock);
 
-	virtio_transport_send_credit_update(vsk);
+	if (fwd_cnt_delta &&
+	    (free_space < VIRTIO_VSOCK_MAX_PKT_BUF_SIZE || low_rx_bytes))
+		virtio_transport_send_credit_update(vsk);
 
 	return recv_actor(sk, skb);
 }
