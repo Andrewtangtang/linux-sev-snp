@@ -117,6 +117,7 @@ struct sk_psock {
 	struct delayed_work		work;
 	struct sock			*sk_pair;
 	struct rcu_work			rwork;
+	bool				is_running;
 };
 
 int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
