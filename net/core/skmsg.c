@@ -653,12 +653,9 @@ static void sk_psock_backlog(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&psock->work_mutex);
-	if (unlikely(state->len)) {
-		len = state->len;
-		off = state->off;
-	}
 
 	while ((skb = skb_peek(&psock->ingress_skb))) {
+		psock->is_running = true;
 		len = skb->len;
 		off = 0;
 		if (skb_bpf_strparser(skb)) {
@@ -676,13 +673,11 @@ static void sk_psock_backlog(struct work_struct *work)
 							  len, ingress);
 			if (ret <= 0) {
 				if (ret == -EAGAIN) {
-					sk_psock_skb_state(psock, state, len, off);
-
 					/* Delay slightly to prioritize any
 					 * other work that might be here.
 					 */
 					if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
-						schedule_delayed_work(&psock->work, 1);
+						continue;
 					goto end;
 				}
 				/* Hard errors break pipe and stop xmit. */
@@ -694,6 +689,7 @@ static void sk_psock_backlog(struct work_struct *work)
 			len -= ret;
 		} while (len);
 
+		psock->is_running = false;
 		skb = skb_dequeue(&psock->ingress_skb);
 		kfree_skb(skb);
 	}
@@ -910,6 +906,7 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
 {
 	struct sk_psock *psock_other;
 	struct sock *sk_other;
+	u32 cur_cpu_num = smp_processor_id(), total_cpus_num = num_online_cpus();
 
 	sk_other = skb_bpf_redirect_fetch(skb);
 	/* This error is a buggy BPF program, it returned a redirect
@@ -939,7 +936,8 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
 	}
 
 	skb_queue_tail(&psock_other->ingress_skb, skb);
-	schedule_delayed_work(&psock_other->work, 0);
+	if (!psock_other->is_running && !delayed_work_pending(&psock_other->work))
+		schedule_delayed_work(&psock_other->work, 0);
 	spin_unlock_bh(&psock_other->ingress_lock);
 	return 0;
 }
@@ -985,6 +983,7 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 	struct sock *sk_other;
 	int err = 0;
 	u32 len, off;
+	u32 cur_cpu_num = smp_processor_id(), total_cpus_num = num_online_cpus();
 
 	switch (verdict) {
 	case __SK_PASS:
@@ -1017,7 +1016,8 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 			spin_lock_bh(&psock->ingress_lock);
 			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 				skb_queue_tail(&psock->ingress_skb, skb);
-				schedule_delayed_work(&psock->work, 0);
+				if (!psock->is_running && !delayed_work_pending(&psock->work))
+					schedule_delayed_work(&psock->work, 0);
 				err = 0;
 			}
 			spin_unlock_bh(&psock->ingress_lock);
@@ -1044,11 +1044,13 @@ static void sk_psock_write_space(struct sock *sk)
 {
 	struct sk_psock *psock;
 	void (*write_space)(struct sock *sk) = NULL;
+	u32 cur_cpu_num = smp_processor_id(), total_cpus_num = num_online_cpus();
 
 	rcu_read_lock();
 	psock = sk_psock(sk);
 	if (likely(psock)) {
-		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)
+		    && !delayed_work_pending(&psock->work))
 			schedule_delayed_work(&psock->work, 0);
 		write_space = psock->saved_write_space;
 	}
