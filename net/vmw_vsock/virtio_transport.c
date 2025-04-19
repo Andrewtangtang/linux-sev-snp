@@ -307,23 +307,38 @@ out_rcu:
 
 static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 {
-	int total_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE + VIRTIO_VSOCK_SKB_HEADROOM;
-	struct scatterlist pkt, *p;
+	struct scatterlist hdr, data, *sgs[2];
 	struct virtqueue *vq;
 	struct sk_buff *skb;
+	struct page *page;
+	void *hdr_buf;
 	int ret;
+	int frags_flag = (GFP_KERNEL & ~__GFP_DIRECT_RECLAIM) |
+			  __GFP_COMP | __GFP_NOWARN |
+			  __GFP_NORETRY;
 
 	vq = vsock->vqs[VSOCK_VQ_RX];
 
 	do {
-		skb = virtio_vsock_alloc_skb(total_len, GFP_KERNEL);
-		if (!skb)
+		hdr_buf = kmalloc(VIRTIO_VSOCK_SKB_HEADROOM, GFP_KERNEL);
+		if (!hdr_buf)
 			break;
 
+		skb = virtio_vsock_alloc_skb(VIRTIO_VSOCK_SKB_HEADROOM, GFP_KERNEL);
+		if (!skb)
+			break;
 		memset(skb->head, 0, VIRTIO_VSOCK_SKB_HEADROOM);
-		sg_init_one(&pkt, virtio_vsock_hdr(skb), total_len);
-		p = &pkt;
-		ret = virtqueue_add_sgs(vq, &p, 0, 1, skb, GFP_KERNEL);
+		sg_init_one(&hdr, virtio_vsock_hdr(skb), VIRTIO_VSOCK_SKB_HEADROOM);
+		sgs[0] = &hdr;
+
+		page = alloc_pages(frags_flag,
+				   ilog2(VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE) - PAGE_SHIFT);
+
+		sg_init_one(&data, page_address(page), VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
+		sgs[1] = &data;
+
+		memcpy(&VIRTIO_VSOCK_SKB_CB(skb)->p, &page, sizeof(struct page *));
+		ret = virtqueue_add_sgs(vq, sgs, 0, 2, skb, GFP_KERNEL);
 		if (ret < 0) {
 			kfree_skb(skb);
 			break;
@@ -625,7 +640,8 @@ static void virtio_transport_rx_work(struct work_struct *work)
 		virtqueue_disable_cb(vq);
 		for (;;) {
 			struct sk_buff *skb;
-			unsigned int len;
+			struct page *p;
+			unsigned int len, payload_len;
 
 			if (!virtio_transport_more_replies(vsock)) {
 				/* Stop rx until the device processes already
@@ -639,16 +655,20 @@ static void virtio_transport_rx_work(struct work_struct *work)
 			if (!skb)
 				break;
 
+			p = VIRTIO_VSOCK_SKB_CB(skb)->p;
 			vsock->rx_buf_nr--;
 
 			/* Drop short/long packets */
 			if (unlikely(len < sizeof(struct virtio_vsock_hdr) ||
-				     len > virtio_vsock_skb_len(skb))) {
+				     len > VIRTIO_VSOCK_SKB_HEADROOM + VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE)) {
 				kfree_skb(skb);
 				continue;
 			}
 
-			virtio_vsock_skb_rx_put(skb);
+			// virtio_vsock_skb_rx_put(skb);
+			payload_len = le32_to_cpu(virtio_vsock_hdr(skb)->len);
+			skb_add_rx_frag(skb, 0, p, 0, payload_len,
+					VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
 			virtio_transport_deliver_tap_pkt(skb);
 			virtio_transport_recv_pkt(&virtio_transport, skb);
 		}
