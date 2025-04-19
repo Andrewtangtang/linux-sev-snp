@@ -384,19 +384,26 @@ vhost_vsock_alloc_skb(struct vhost_virtqueue *vq,
 	struct virtio_vsock_hdr *hdr;
 	struct iov_iter iov_iter;
 	struct sk_buff *skb;
+	struct page *page;
 	size_t payload_len;
 	size_t nbytes;
 	size_t len;
+	int frags_flag = (GFP_ATOMIC & ~__GFP_DIRECT_RECLAIM) |
+			  __GFP_COMP | __GFP_NOWARN |
+			  __GFP_NORETRY;
 
 	if (in != 0) {
 		vq_err(vq, "Expected 0 input buffers, got %u\n", in);
 		return NULL;
 	}
 
-	len = iov_length(vq->iov, out);
-
 	/* len contains both payload and hdr */
-	skb = virtio_vsock_alloc_skb(len, GFP_KERNEL);
+	len = iov_length(vq->iov, out);
+	if (len > PAGE_SIZE)
+		skb = virtio_vsock_alloc_skb(VIRTIO_VSOCK_SKB_HEADROOM, GFP_KERNEL);
+	else
+		skb = virtio_vsock_alloc_skb(len, GFP_KERNEL);
+
 	if (!skb)
 		return NULL;
 
@@ -424,9 +431,20 @@ vhost_vsock_alloc_skb(struct vhost_virtqueue *vq,
 		return NULL;
 	}
 
-	virtio_vsock_skb_rx_put(skb);
+	if (len > PAGE_SIZE) {
+		page = alloc_pages(frags_flag, ilog2(roundup_pow_of_two(payload_len)) - PAGE_SHIFT);
+		if (!page) {
+			kfree_skb(skb);
+			return NULL;
+		}
 
-	nbytes = copy_from_iter(skb->data, payload_len, &iov_iter);
+		nbytes = copy_from_iter(page_to_virt(page), payload_len, &iov_iter);
+		skb_add_rx_frag(skb, 0, page, 0, payload_len, roundup_pow_of_two(payload_len));
+	} else {
+		virtio_vsock_skb_rx_put(skb);
+		nbytes = copy_from_iter(skb->data, payload_len, &iov_iter);
+	}
+
 	if (nbytes != payload_len) {
 		vq_err(vq, "Expected %zu byte payload, got %zu bytes\n",
 		       payload_len, nbytes);
