@@ -74,7 +74,7 @@ static bool virtio_transport_can_zcopy(const struct virtio_transport *t_ops,
 static int virtio_transport_init_zcopy_skb(struct vsock_sock *vsk,
 					   struct sk_buff *skb,
 					   struct msghdr *msg,
-					   bool zerocopy)
+					   int zc)
 {
 	struct ubuf_info *uarg;
 
@@ -92,7 +92,7 @@ static int virtio_transport_init_zcopy_skb(struct vsock_sock *vsk,
 			return -1;
 
 		uarg_zc = uarg_to_msgzc(uarg);
-		uarg_zc->zerocopy = zerocopy ? 1 : 0;
+		uarg_zc->zerocopy = zc == MSG_ZEROCOPY ? 1 : 0;
 	}
 
 	skb_zcopy_init(skb, uarg);
@@ -103,14 +103,22 @@ static int virtio_transport_init_zcopy_skb(struct vsock_sock *vsk,
 static int virtio_transport_fill_skb(struct sk_buff *skb,
 				     struct virtio_vsock_pkt_info *info,
 				     size_t len,
-				     bool zcopy)
+				     int zc)
 {
-	if (zcopy)
+	if (zc == MSG_ZEROCOPY)
 		return __zerocopy_sg_from_iter(info->msg, NULL, skb,
 					       &info->msg->msg_iter,
 					       len);
-
-	return memcpy_from_msg(skb_put(skb, len), info->msg, len);
+	else if (zc == MSG_SPLICE_PAGES) {
+		int size;
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+		size = skb_splice_from_iter(skb, &info->msg->msg_iter,
+					    len, GFP_KERNEL);
+		if (size >= 0)
+			refcount_add(size, &skb->sk->sk_wmem_alloc);
+		return size >= 0;
+	} else
+		return memcpy_from_msg(skb_put(skb, len), info->msg, len);
 }
 
 static void virtio_transport_init_hdr(struct sk_buff *skb,
@@ -247,7 +255,7 @@ static u16 virtio_transport_get_type(struct sock *sk)
 /* Returns new sk_buff on success, otherwise returns NULL. */
 static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *info,
 						  size_t payload_len,
-						  bool zcopy,
+						  int zc,
 						  u32 src_cid,
 						  u32 src_port,
 						  u32 dst_cid,
@@ -259,7 +267,7 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 
 	skb_len = VIRTIO_VSOCK_SKB_HEADROOM;
 
-	if (!zcopy)
+	if (!zc)
 		skb_len += payload_len;
 
 	skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL);
@@ -277,7 +285,7 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 	 * when 'vsk' == NULL is VIRTIO_VSOCK_OP_RST control message
 	 * without payload.
 	 */
-	WARN_ON_ONCE(!(vsk && (info->msg && payload_len)) && zcopy);
+	WARN_ON_ONCE(!(vsk && (info->msg && payload_len)) && zc);
 
 	/* Set owner here, because '__zerocopy_sg_from_iter()' uses
 	 * owner of skb without check to update 'sk_wmem_alloc'.
@@ -288,8 +296,8 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 	if (info->msg && payload_len > 0) {
 		int err;
 
-		err = virtio_transport_fill_skb(skb, info, payload_len, zcopy);
-		if (err)
+		err = virtio_transport_fill_skb(skb, info, payload_len, zc);
+		if (err < 0)
 			goto out;
 
 		if (msg_data_left(info->msg) == 0 &&
@@ -312,7 +320,7 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 					 info->type,
 					 info->op,
 					 info->flags,
-					 zcopy);
+					 zc);
 
 	return skb;
 out:
@@ -333,7 +341,7 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
 	const struct virtio_transport *t_ops;
 	struct virtio_vsock_sock *vvs;
 	u32 pkt_len = info->pkt_len;
-	bool can_zcopy = false;
+	int zc = 0;
 	u32 rest_len;
 	int ret;
 
@@ -366,13 +374,16 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
 		/* If zerocopy is not enabled by 'setsockopt()', we behave as
 		 * there is no MSG_ZEROCOPY flag set.
 		 */
-		if (!sock_flag(sk_vsock(vsk), SOCK_ZEROCOPY))
-			info->msg->msg_flags &= ~MSG_ZEROCOPY;
+		if (!sock_flag(sk_vsock(vsk), SOCK_ZEROCOPY)) {
+			info->msg->msg_flags &= ~(MSG_ZEROCOPY | MSG_SPLICE_PAGES);
+		}
 
 		if (info->msg->msg_flags & MSG_ZEROCOPY)
-			can_zcopy = virtio_transport_can_zcopy(t_ops, info, pkt_len);
-
-		if (can_zcopy)
+			zc = virtio_transport_can_zcopy(t_ops, info, pkt_len) ?
+				MSG_ZEROCOPY : 0;
+		else if (info->msg->msg_flags & MSG_SPLICE_PAGES)
+			zc = MSG_SPLICE_PAGES;
+		if (zc)
 			max_skb_len = min_t(u32, VIRTIO_VSOCK_MAX_PKT_BUF_SIZE,
 					    (MAX_SKB_FRAGS * PAGE_SIZE));
 	}
@@ -385,7 +396,7 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
 
 		skb_len = min(max_skb_len, rest_len);
 
-		skb = virtio_transport_alloc_skb(info, skb_len, can_zcopy,
+		skb = virtio_transport_alloc_skb(info, skb_len, zc,
 						 src_cid, src_port,
 						 dst_cid, dst_port);
 		if (!skb) {
@@ -402,7 +413,7 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
 		    skb_len == rest_len && info->op == VIRTIO_VSOCK_OP_RW) {
 			if (virtio_transport_init_zcopy_skb(vsk, skb,
 							    info->msg,
-							    can_zcopy)) {
+							    zc)) {
 				kfree_skb(skb);
 				ret = -ENOMEM;
 				break;
