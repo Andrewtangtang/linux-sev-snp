@@ -3269,10 +3269,14 @@ typedef int (*sendmsg_func)(struct sock *sk, struct msghdr *msg);
 static int __skb_send_sock(struct sock *sk, struct sk_buff *skb, int offset,
 			   int len, sendmsg_func sendmsg)
 {
+	struct bio_vec bvecs[MAX_SKB_FRAGS] = {};
 	unsigned int orig_len = len;
 	struct sk_buff *head = skb;
-	unsigned short fragidx;
-	int slen, ret;
+	unsigned short fragidx, bvecidx;
+	int slen, ret, frags_len = 0;
+	struct msghdr msg_frags = {
+		.msg_flags = MSG_SPLICE_PAGES | MSG_DONTWAIT,
+	};
 
 do_frag_list:
 
@@ -3314,33 +3318,29 @@ do_frag_list:
 		offset -= skb_frag_size(frag);
 	}
 
-	for (; len && fragidx < skb_shinfo(skb)->nr_frags; fragidx++) {
-		skb_frag_t *frag  = &skb_shinfo(skb)->frags[fragidx];
+	for (bvecidx = 0; len && fragidx < skb_shinfo(skb)->nr_frags; fragidx++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[fragidx];
 
 		slen = min_t(size_t, len, skb_frag_size(frag) - offset);
 
-		while (slen) {
-			struct bio_vec bvec;
-			struct msghdr msg = {
-				.msg_flags = MSG_SPLICE_PAGES | MSG_DONTWAIT,
-			};
+		bvec_set_page(&bvecs[bvecidx++], skb_frag_page(frag), slen,
+			      skb_frag_off(frag) + offset);
 
-			bvec_set_page(&bvec, skb_frag_page(frag), slen,
-				      skb_frag_off(frag) + offset);
-			iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1,
-				      slen);
+		len -= slen;
+		frags_len += slen;
+		offset = 0;
+	}
 
-			ret = INDIRECT_CALL_2(sendmsg, sendmsg_locked,
-					      sendmsg_unlocked, sk, &msg);
-			if (ret <= 0)
-				goto error;
-
-			len -= ret;
-			offset += ret;
-			slen -= ret;
+	iov_iter_bvec(&msg_frags.msg_iter, ITER_SOURCE, bvecs, bvecidx, frags_len);
+	while (frags_len) {
+		ret = INDIRECT_CALL_2(sendmsg, sendmsg_locked, sendmsg_unlocked,
+				      sk, &msg_frags);
+		if (ret <= 0) {
+			len += frags_len;
+			goto error;
 		}
 
-		offset = 0;
+		frags_len -= ret;
 	}
 
 	if (len) {
