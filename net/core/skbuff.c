@@ -7195,11 +7195,12 @@ ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 			     ssize_t maxsize, gfp_t gfp)
 {
 	size_t frag_limit = READ_ONCE(net_hotdata.sysctl_max_skb_frags);
-	struct page *pages[8], **ppages = pages;
+	struct page *pages[MAX_SKB_FRAGS], **ppages = pages;
 	ssize_t spliced = 0, ret = 0;
 	unsigned int i;
 
 	while (iter->count > 0) {
+		struct page *last_head;
 		ssize_t space, nr, len;
 		size_t off;
 
@@ -7218,15 +7219,20 @@ ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 		}
 
 		i = 0;
+		last_head = compound_head(pages[0]);
 		do {
 			struct page *page = pages[i++];
-			size_t part = min_t(size_t, PAGE_SIZE - off, len);
+			struct page *head = compound_head(page);
+			size_t part = min_t(size_t, PAGE_SIZE - (off & (PAGE_SIZE-1)), len);
 
 			ret = -EIO;
-			if (WARN_ON_ONCE(!sendpage_ok(page)))
+			if (WARN_ON_ONCE(!sendpage_ok(head)))
 				goto out;
 
-			ret = skb_append_pagefrags(skb, page, off, part,
+			if (head != last_head)
+				off = 0;
+
+			ret = skb_append_pagefrags(skb, head, off, part,
 						   frag_limit);
 			if (ret < 0) {
 				iov_iter_revert(iter, len);
@@ -7234,12 +7240,13 @@ ssize_t skb_splice_from_iter(struct sk_buff *skb, struct iov_iter *iter,
 			}
 
 			if (skb->ip_summed == CHECKSUM_NONE)
-				skb_splice_csum_page(skb, page, off, part);
+				skb_splice_csum_page(skb, head, off, part);
 
-			off = 0;
+			off += part;
 			spliced += part;
 			maxsize -= part;
 			len -= part;
+			last_head = head;
 		} while (len > 0);
 
 		if (maxsize <= 0)
