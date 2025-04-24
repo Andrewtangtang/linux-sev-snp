@@ -21,6 +21,10 @@
 #include <linux/mutex.h>
 #include <net/af_vsock.h>
 
+static unsigned virtio_vsock_rx_buf_size;
+module_param(virtio_vsock_rx_buf_size, uint, 0444);
+MODULE_PARM_DESC(virtio_vsock_rx_buf_size, "Adjust rx buf size");
+
 static struct workqueue_struct *virtio_vsock_workqueue;
 static struct virtio_vsock __rcu *the_virtio_vsock;
 static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
@@ -332,9 +336,9 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 		sgs[0] = &hdr;
 
 		page = alloc_pages(frags_flag,
-				   ilog2(VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE) - PAGE_SHIFT);
+				   ilog2(virtio_vsock_rx_buf_size) - PAGE_SHIFT);
 
-		sg_init_one(&data, page_address(page), VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
+		sg_init_one(&data, page_address(page), virtio_vsock_rx_buf_size);
 		sgs[1] = &data;
 
 		memcpy(&VIRTIO_VSOCK_SKB_CB(skb)->p, &page, sizeof(struct page *));
@@ -660,15 +664,14 @@ static void virtio_transport_rx_work(struct work_struct *work)
 
 			/* Drop short/long packets */
 			if (unlikely(len < sizeof(struct virtio_vsock_hdr) ||
-				     len > VIRTIO_VSOCK_SKB_HEADROOM + VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE)) {
+				     len > VIRTIO_VSOCK_SKB_HEADROOM + virtio_vsock_rx_buf_size)) {
 				kfree_skb(skb);
 				continue;
 			}
 
 			// virtio_vsock_skb_rx_put(skb);
 			payload_len = le32_to_cpu(virtio_vsock_hdr(skb)->len);
-			skb_add_rx_frag(skb, 0, p, 0, payload_len,
-					VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
+			skb_add_rx_frag(skb, 0, p, 0, payload_len, virtio_vsock_rx_buf_size);
 			virtio_transport_deliver_tap_pkt(skb);
 			virtio_transport_recv_pkt(&virtio_transport, skb);
 		}
@@ -932,6 +935,7 @@ static int __init virtio_vsock_init(void)
 {
 	int ret;
 
+	virtio_vsock_rx_buf_size = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
 	virtio_vsock_workqueue = alloc_workqueue("virtio_vsock", 0, 0);
 	if (!virtio_vsock_workqueue)
 		return -ENOMEM;
