@@ -113,6 +113,8 @@ struct socket_wq {
  *  @file: File back pointer for gc
  *  @sk: internal networking protocol agnostic socket representation
  *  @wq: wait queue for several uses
+ *  @vsock_sock: for the stub tcp socket, it is the vsock for transmitting data
+ *  @stub_sock: for the vsock_sock, it is the stub tcp socket
  */
 struct socket {
 	socket_state		state;
@@ -126,6 +128,7 @@ struct socket {
 	const struct proto_ops	*ops; /* Might change with IPV6_ADDRFORM or MPTCP. */
 
 	struct socket_wq	wq;
+	struct socket		*vsock_sock;
 };
 
 /*
