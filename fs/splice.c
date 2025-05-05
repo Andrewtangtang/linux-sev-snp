@@ -808,6 +808,9 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 
 	pipe_lock(pipe);
 
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
+
 	while (len > 0) {
 		unsigned int head, tail, mask, bc = 0;
 		size_t remain = len;

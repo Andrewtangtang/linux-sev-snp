@@ -110,6 +110,8 @@
 #include <linux/errqueue.h>
 #include <linux/ptp_clock_kernel.h>
 #include <trace/events/sock.h>
+#include <linux/vm_sockets.h>
+#include <net/af_vsock.h>
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
 unsigned int sysctl_net_busy_read __read_mostly;
@@ -624,6 +626,7 @@ struct socket *sock_alloc(void)
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
 	inode->i_op = &sockfs_inode_ops;
+	sock->vsock_sock = NULL;
 
 	return sock;
 }
@@ -1089,6 +1092,9 @@ static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 	struct socket *sock = file->private_data;
 	const struct proto_ops *ops;
 
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
+
 	ops = READ_ONCE(sock->ops);
 	if (unlikely(!ops->splice_read))
 		return copy_splice_read(file, ppos, pipe, len, flags);
@@ -1123,6 +1129,9 @@ static ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (!iov_iter_count(to))	/* Match SYS5 behaviour */
 		return 0;
 
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
+
 	res = sock_recvmsg(sock, &msg, msg.msg_flags);
 	*to = msg.msg_iter;
 	return res;
@@ -1144,6 +1153,9 @@ static ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (sock->type == SOCK_SEQPACKET)
 		msg.msg_flags |= MSG_EOR;
+
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
 
 	res = __sock_sendmsg(sock, &msg);
 	*from = msg.msg_iter;
@@ -1382,6 +1394,12 @@ static __poll_t sock_poll(struct file *file, poll_table *wait)
 	const struct proto_ops *ops = READ_ONCE(sock->ops);
 	__poll_t events = poll_requested_events(wait), flag = 0;
 
+	if (sock->sk->sk_state != TCP_LISTEN && sock->vsock_sock) {
+		sock = sock->vsock_sock;
+		file = sock->file;
+		ops = READ_ONCE(sock->ops);
+	}
+
 	if (!ops->poll)
 		return 0;
 
@@ -1406,7 +1424,12 @@ static int sock_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int sock_close(struct inode *inode, struct file *filp)
 {
-	__sock_release(SOCKET_I(inode), inode);
+	struct socket *sock = SOCKET_I(inode);
+
+	if (sock->vsock_sock)
+		fput(sock->vsock_sock->file);
+
+	__sock_release(sock, inode);
 	return 0;
 }
 
@@ -1638,7 +1661,7 @@ EXPORT_SYMBOL(sock_create_kern);
 
 static struct socket *__sys_socket_create(int family, int type, int protocol)
 {
-	struct socket *sock;
+	struct socket *sock, *vsock_sock;
 	int retval;
 
 	/* Check the SOCK_* constants for consistency.  */
@@ -1654,6 +1677,14 @@ static struct socket *__sys_socket_create(int family, int type, int protocol)
 	retval = sock_create(family, type, protocol, &sock);
 	if (retval < 0)
 		return ERR_PTR(retval);
+
+	if (family == AF_INET && type == SOCK_STREAM) {
+		/* Only support TCP socket for now */
+		retval = sock_create(AF_VSOCK, SOCK_STREAM, 0, &vsock_sock);
+		if (retval < 0)
+			return ERR_PTR(retval);
+		sock->vsock_sock = vsock_sock;
+	}
 
 	return sock;
 }
@@ -1696,7 +1727,7 @@ __bpf_hook_end();
 int __sys_socket(int family, int type, int protocol)
 {
 	struct socket *sock;
-	int flags;
+	int flags, ret;
 
 	sock = __sys_socket_create(family, type,
 				   update_socket_protocol(family, type, protocol));
@@ -1707,7 +1738,16 @@ int __sys_socket(int family, int type, int protocol)
 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
 
-	return sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));
+	ret = sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));
+
+	if (sock->vsock_sock) {
+		struct file *vsock_file;
+		vsock_file = sock_alloc_file(sock->vsock_sock, flags & (O_CLOEXEC | O_NONBLOCK), NULL);
+		if (IS_ERR(vsock_file))
+			return PTR_ERR(vsock_file);
+	}
+
+	return ret;
 }
 
 SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
@@ -1828,6 +1868,20 @@ int __sys_bind_socket(struct socket *sock, struct sockaddr_storage *address,
 		err = READ_ONCE(sock->ops)->bind(sock,
 						 (struct sockaddr *)address,
 						 addrlen);
+
+	if (!err && sock->vsock_sock) {
+		struct socket *vsock_sock = sock->vsock_sock;
+		struct sockaddr_in *addr_tcp = (struct sockaddr_in *)address;
+		struct sockaddr_vm addr_vm = {
+			.svm_cid	= VMADDR_CID_ANY,
+			.svm_family	= AF_VSOCK,
+			.svm_port	= ntohs(addr_tcp->sin_port),
+		};
+
+		err = READ_ONCE(vsock_sock->ops)->bind(vsock_sock,
+						       (struct sockaddr *)&addr_vm,
+						       sizeof(addr_vm));
+	}
 	return err;
 }
 
@@ -1880,6 +1934,13 @@ int __sys_listen_socket(struct socket *sock, int backlog)
 	err = security_socket_listen(sock, backlog);
 	if (!err)
 		err = READ_ONCE(sock->ops)->listen(sock, backlog);
+
+	if (sock->vsock_sock) {
+		sock = sock->vsock_sock;
+		if (!err)
+			err = READ_ONCE(sock->ops)->listen(sock, backlog);
+	}
+
 	return err;
 }
 
@@ -1955,6 +2016,28 @@ struct file *do_accept(struct file *file, struct proto_accept_arg *arg,
 			goto out_fd;
 	}
 
+	if (sock->vsock_sock) {
+		struct socket *vsock_sock = sock->vsock_sock;
+		struct socket *new_vsock_sock;
+
+		new_vsock_sock = sock_alloc();
+		if (!new_vsock_sock)
+			return ERR_PTR(-ENFILE);
+
+		ops = READ_ONCE(vsock_sock->ops);
+		new_vsock_sock->type = vsock_sock->type;
+		new_vsock_sock->ops = ops;
+
+		__module_get(ops->owner);
+
+		/* disabling O_NONBLOCK is necessary for syncing state */
+		arg->flags &= ~O_NONBLOCK;
+		err = ops->accept(vsock_sock, new_vsock_sock, arg);
+		if (err < 0)
+			goto out_fd;
+		newsock->vsock_sock = new_vsock_sock;
+	}
+
 	/* File flags are not inherited via accept() unlike another OSes. */
 	return newfile;
 out_fd:
@@ -1967,6 +2050,7 @@ static int __sys_accept4_file(struct file *file, struct sockaddr __user *upeer_s
 {
 	struct proto_accept_arg arg = { };
 	struct file *newfile;
+	struct socket *new_vsock_sock;
 	int newfd;
 
 	if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
@@ -1986,6 +2070,15 @@ static int __sys_accept4_file(struct file *file, struct sockaddr __user *upeer_s
 		return PTR_ERR(newfile);
 	}
 	fd_install(newfd, newfile);
+
+	new_vsock_sock = sock_from_file(newfile)->vsock_sock;
+	if (new_vsock_sock) {
+		struct file *vsock_file;
+		vsock_file = sock_alloc_file(new_vsock_sock, flags & (O_CLOEXEC | O_NONBLOCK), NULL);
+		if (IS_ERR(vsock_file))
+			return PTR_ERR(vsock_file);
+	}
+
 	return newfd;
 }
 
@@ -2055,6 +2148,20 @@ int __sys_connect_file(struct file *file, struct sockaddr_storage *address,
 
 	err = READ_ONCE(sock->ops)->connect(sock, (struct sockaddr *)address,
 				addrlen, sock->file->f_flags | file_flags);
+
+	if (!err && sock->vsock_sock) {
+		struct socket *vsock_sock = sock->vsock_sock;
+		struct sockaddr_in *addr_tcp = (struct sockaddr_in *)address;
+		struct sockaddr_vm addr_vm = {
+			.svm_cid	= VMADDR_CID_HOST,
+			.svm_family	= AF_VSOCK,
+			.svm_port	= ntohs(addr_tcp->sin_port),
+		};
+		err = READ_ONCE(vsock_sock->ops)->connect(sock,
+					(struct sockaddr *)&addr_vm,
+					sizeof(addr_vm),
+					vsock_sock->file->f_flags | file_flags);
+	}
 out:
 	return err;
 }
@@ -2195,6 +2302,10 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 	msg.msg_flags = flags;
+
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
+
 	return __sock_sendmsg(sock, &msg);
 }
 
@@ -2228,7 +2339,7 @@ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
 		/* Save some cycles and don't copy the address if not needed */
 		.msg_name = addr ? (struct sockaddr *)&address : NULL,
 	};
-	struct socket *sock;
+	struct socket *sock, *orig_sock;
 	int err, err2;
 
 	err = import_ubuf(ITER_DEST, ubuf, size, &msg.msg_iter);
@@ -2239,11 +2350,14 @@ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
 
 	if (fd_empty(f))
 		return -EBADF;
-	sock = sock_from_file(fd_file(f));
+	orig_sock = sock = sock_from_file(fd_file(f));
 	if (unlikely(!sock))
 		return -ENOTSOCK;
 
-	if (sock->file->f_flags & O_NONBLOCK)
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
+
+	if (orig_sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 	err = sock_recvmsg(sock, &msg, flags);
 
@@ -2428,6 +2542,7 @@ int __sys_shutdown_sock(struct socket *sock, int how)
 
 int __sys_shutdown(int fd, int how)
 {
+	int ret;
 	struct socket *sock;
 	CLASS(fd, f)(fd);
 
@@ -2437,7 +2552,14 @@ int __sys_shutdown(int fd, int how)
 	if (unlikely(!sock))
 		return -ENOTSOCK;
 
-	return __sys_shutdown_sock(sock, how);
+	ret = __sys_shutdown_sock(sock, how);
+
+	if (!ret && sock->vsock_sock) {
+		sock = sock->vsock_sock;
+		ret = __sys_shutdown_sock(sock, how);
+	}
+
+	return ret;
 }
 
 SYSCALL_DEFINE2(shutdown, int, fd, int, how)
@@ -2534,6 +2656,10 @@ static int ____sys_sendmsg(struct socket *sock, struct msghdr *msg_sys,
 	unsigned char *ctl_buf = ctl;
 	int ctl_len;
 	ssize_t err;
+	struct socket *orig_sock = sock;
+
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
 
 	err = -ENOBUFS;
 
@@ -2566,7 +2692,7 @@ static int ____sys_sendmsg(struct socket *sock, struct msghdr *msg_sys,
 	flags &= ~MSG_INTERNAL_SENDMSG_FLAGS;
 	msg_sys->msg_flags = flags;
 
-	if (sock->file->f_flags & O_NONBLOCK)
+	if (orig_sock->file->f_flags & O_NONBLOCK)
 		msg_sys->msg_flags |= MSG_DONTWAIT;
 	/*
 	 * If this is sendmmsg() and current destination address is same as
@@ -2787,6 +2913,10 @@ static int ____sys_recvmsg(struct socket *sock, struct msghdr *msg_sys,
 	unsigned long cmsg_ptr;
 	int len;
 	ssize_t err;
+	struct socket *orig_sock = sock;
+
+	if (sock->vsock_sock)
+		sock = sock->vsock_sock;
 
 	msg_sys->msg_name = &addr;
 	cmsg_ptr = (unsigned long)msg_sys->msg_control;
@@ -2795,7 +2925,7 @@ static int ____sys_recvmsg(struct socket *sock, struct msghdr *msg_sys,
 	/* We assume all kernel code knows the size of sockaddr_storage */
 	msg_sys->msg_namelen = 0;
 
-	if (sock->file->f_flags & O_NONBLOCK)
+	if (orig_sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 
 	if (unlikely(nosec))
