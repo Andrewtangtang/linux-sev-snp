@@ -97,6 +97,7 @@
 #include <net/wext.h>
 #include <net/cls_cgroup.h>
 
+#include <linux/skmsg.h>
 #include <net/sock.h>
 #include <linux/netfilter.h>
 
@@ -3295,6 +3296,8 @@ static int __init sock_init(void)
 #endif
 
 	ptp_classifier_init();
+
+	err = psock_init();
 
 out:
 	return err;
