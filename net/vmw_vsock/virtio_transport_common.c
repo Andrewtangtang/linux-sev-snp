@@ -1554,7 +1554,7 @@ virtio_transport_recv_listen(struct sock *sk, struct sk_buff *skb,
 
 	sk_acceptq_added(sk);
 
-	lock_sock_nested(child, SINGLE_DEPTH_NESTING);
+	bh_lock_sock_nested(child);
 
 	child->sk_state = TCP_ESTABLISHED;
 
@@ -1582,7 +1582,7 @@ virtio_transport_recv_listen(struct sock *sk, struct sk_buff *skb,
 	vsock_enqueue_accept(sk, child);
 	virtio_transport_send_response(vchild, skb);
 
-	release_sock(child);
+	bh_unlock_sock(child);
 
 	sk->sk_data_ready(sk);
 	return 0;
@@ -1652,7 +1652,7 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 
 	vsk = vsock_sk(sk);
 
-	lock_sock(sk);
+	bh_lock_sock(sk);
 
 	/* Check if sk has been closed or assigned to another transport before
 	 * lock_sock (note: listener sockets are not assigned to any transport)
@@ -1660,7 +1660,7 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 	if (sock_flag(sk, SOCK_DONE) ||
 	    (sk->sk_state != TCP_LISTEN && vsk->transport != &t->transport)) {
 		(void)virtio_transport_reset_no_sock(t, skb);
-		release_sock(sk);
+		bh_unlock_sock(sk);
 		sock_put(sk);
 		goto free_pkt;
 	}
@@ -1696,7 +1696,7 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 		break;
 	}
 
-	release_sock(sk);
+	bh_unlock_sock(sk);
 
 	/* Release refcnt obtained when we fetched this socket out of the
 	 * bound or connected list.
