@@ -39,6 +39,7 @@ struct virtio_vsock {
 	 * must be accessed with tx_lock held.
 	 */
 	struct mutex tx_lock;
+	spinlock_t   tx_spinlock;
 	bool tx_run;
 
 	struct work_struct send_pkt_work;
@@ -50,6 +51,7 @@ struct virtio_vsock {
 	 * must be accessed with rx_lock held.
 	 */
 	struct mutex rx_lock;
+	spinlock_t   rx_spinlock;
 	bool rx_run;
 	int rx_buf_nr;
 	int rx_buf_max_nr;
@@ -58,6 +60,7 @@ struct virtio_vsock {
 	 * vqs[VSOCK_VQ_EVENT] must be accessed with event_lock held.
 	 */
 	struct mutex event_lock;
+	spinlock_t   event_spinlock;
 	bool event_run;
 	struct virtio_vsock_event event_list[8];
 
@@ -160,7 +163,7 @@ virtio_transport_send_pkt_work(struct work_struct *work)
 	bool added = false;
 	bool restart_rx = false;
 
-	mutex_lock(&vsock->tx_lock);
+	spin_lock_bh(&vsock->tx_spinlock);
 
 	if (!vsock->tx_run)
 		goto out;
@@ -178,7 +181,7 @@ virtio_transport_send_pkt_work(struct work_struct *work)
 
 		reply = virtio_vsock_skb_reply(skb);
 
-		ret = virtio_transport_send_skb(skb, vq, vsock, GFP_KERNEL);
+		ret = virtio_transport_send_skb(skb, vq, vsock, GFP_ATOMIC);
 		if (ret < 0) {
 			virtio_vsock_skb_queue_head(&vsock->send_pkt_queue, skb);
 			break;
@@ -202,7 +205,7 @@ virtio_transport_send_pkt_work(struct work_struct *work)
 		virtqueue_kick(vq);
 
 out:
-	mutex_unlock(&vsock->tx_lock);
+	spin_unlock_bh(&vsock->tx_spinlock);
 
 	if (restart_rx)
 		queue_work(virtio_vsock_workqueue, &vsock->rx_work);
@@ -217,15 +220,13 @@ static int virtio_transport_send_skb_fast_path(struct virtio_vsock *vsock, struc
 	int ret;
 
 	/* Inside RCU, can't sleep! */
-	ret = mutex_trylock(&vsock->tx_lock);
-	if (unlikely(ret == 0))
-		return -EBUSY;
+	spin_lock_bh(&vsock->tx_spinlock);
 
 	ret = virtio_transport_send_skb(skb, vq, vsock, GFP_ATOMIC);
 	if (ret == 0)
 		virtqueue_kick(vq);
 
-	mutex_unlock(&vsock->tx_lock);
+	spin_unlock_bh(&vsock->tx_spinlock);
 
 	return ret;
 }
@@ -312,14 +313,14 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 	struct sk_buff *skb;
 	struct page *page;
 	int ret;
-	int frags_flag = (GFP_KERNEL & ~__GFP_DIRECT_RECLAIM) |
+	int frags_flag = (GFP_ATOMIC & ~__GFP_DIRECT_RECLAIM) |
 			  __GFP_COMP | __GFP_NOWARN |
 			  __GFP_NORETRY;
 
 	vq = vsock->vqs[VSOCK_VQ_RX];
 
 	do {
-		skb = virtio_vsock_alloc_skb(VIRTIO_VSOCK_SKB_HEADROOM, GFP_KERNEL);
+		skb = virtio_vsock_alloc_skb(VIRTIO_VSOCK_SKB_HEADROOM, GFP_ATOMIC);
 		if (!skb)
 			break;
 		memset(skb->head, 0, VIRTIO_VSOCK_SKB_HEADROOM);
@@ -342,7 +343,7 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 		sgs[1] = &data;
 
 		memcpy(&VIRTIO_VSOCK_SKB_CB(skb)->p, &page, sizeof(struct page *));
-		ret = virtqueue_add_sgs(vq, sgs, 0, 2, skb, GFP_KERNEL);
+		ret = virtqueue_add_sgs(vq, sgs, 0, 2, skb, GFP_ATOMIC);
 		if (ret < 0) {
 			kfree_skb(skb);
 			break;
@@ -363,7 +364,7 @@ static void virtio_transport_tx_work(struct work_struct *work)
 	bool added = false;
 
 	vq = vsock->vqs[VSOCK_VQ_TX];
-	mutex_lock(&vsock->tx_lock);
+	spin_lock_bh(&vsock->tx_spinlock);
 
 	if (!vsock->tx_run)
 		goto out;
@@ -380,7 +381,7 @@ static void virtio_transport_tx_work(struct work_struct *work)
 	} while (!virtqueue_enable_cb(vq));
 
 out:
-	mutex_unlock(&vsock->tx_lock);
+	spin_unlock_bh(&vsock->tx_spinlock);
 
 	if (added)
 		queue_work(virtio_vsock_workqueue, &vsock->send_pkt_work);
@@ -409,7 +410,7 @@ static int virtio_vsock_event_fill_one(struct virtio_vsock *vsock,
 
 	sg_init_one(&sg, event, sizeof(*event));
 
-	return virtqueue_add_inbuf(vq, &sg, 1, event, GFP_KERNEL);
+	return virtqueue_add_inbuf(vq, &sg, 1, event, GFP_ATOMIC);
 }
 
 /* event_lock must be held */
@@ -469,7 +470,7 @@ static void virtio_transport_event_work(struct work_struct *work)
 
 	vq = vsock->vqs[VSOCK_VQ_EVENT];
 
-	mutex_lock(&vsock->event_lock);
+	spin_lock_bh(&vsock->event_spinlock);
 
 	if (!vsock->event_run)
 		goto out;
@@ -489,7 +490,7 @@ static void virtio_transport_event_work(struct work_struct *work)
 
 	virtqueue_kick(vsock->vqs[VSOCK_VQ_EVENT]);
 out:
-	mutex_unlock(&vsock->event_lock);
+	spin_unlock_bh(&vsock->event_spinlock);
 }
 
 static void virtio_vsock_event_done(struct virtqueue *vq)
@@ -635,7 +636,7 @@ static void virtio_transport_rx_work(struct work_struct *work)
 
 	vq = vsock->vqs[VSOCK_VQ_RX];
 
-	mutex_lock(&vsock->rx_lock);
+	spin_lock_bh(&vsock->rx_spinlock);
 
 	if (!vsock->rx_run)
 		goto out;
@@ -681,7 +682,7 @@ static void virtio_transport_rx_work(struct work_struct *work)
 out:
 	if (vsock->rx_buf_nr < vsock->rx_buf_max_nr / 2)
 		virtio_vsock_rx_fill(vsock);
-	mutex_unlock(&vsock->rx_lock);
+	spin_unlock_bh(&vsock->rx_spinlock);
 }
 
 static int virtio_vsock_vqs_init(struct virtio_vsock *vsock)
@@ -712,12 +713,16 @@ static void virtio_vsock_vqs_start(struct virtio_vsock *vsock)
 	mutex_unlock(&vsock->tx_lock);
 
 	mutex_lock(&vsock->rx_lock);
+	spin_lock(&vsock->rx_spinlock);
 	virtio_vsock_rx_fill(vsock);
+	spin_unlock(&vsock->rx_spinlock);
 	vsock->rx_run = true;
 	mutex_unlock(&vsock->rx_lock);
 
 	mutex_lock(&vsock->event_lock);
+	spin_lock(&vsock->event_spinlock);
 	virtio_vsock_event_fill(vsock);
+	spin_unlock(&vsock->event_spinlock);
 	vsock->event_run = true;
 	mutex_unlock(&vsock->event_lock);
 
@@ -762,15 +767,15 @@ static void virtio_vsock_vqs_del(struct virtio_vsock *vsock)
 	 */
 	virtio_reset_device(vdev);
 
-	mutex_lock(&vsock->rx_lock);
+	spin_lock_bh(&vsock->rx_spinlock);
 	while ((skb = virtqueue_detach_unused_buf(vsock->vqs[VSOCK_VQ_RX])))
 		kfree_skb(skb);
-	mutex_unlock(&vsock->rx_lock);
+	spin_unlock_bh(&vsock->rx_spinlock);
 
-	mutex_lock(&vsock->tx_lock);
+	spin_lock_bh(&vsock->tx_spinlock);
 	while ((skb = virtqueue_detach_unused_buf(vsock->vqs[VSOCK_VQ_TX])))
 		kfree_skb(skb);
-	mutex_unlock(&vsock->tx_lock);
+	spin_unlock_bh(&vsock->tx_spinlock);
 
 	virtio_vsock_skb_queue_purge(&vsock->send_pkt_queue);
 
@@ -810,6 +815,9 @@ static int virtio_vsock_probe(struct virtio_device *vdev)
 	mutex_init(&vsock->tx_lock);
 	mutex_init(&vsock->rx_lock);
 	mutex_init(&vsock->event_lock);
+	spin_lock_init(&vsock->tx_spinlock);
+	spin_lock_init(&vsock->rx_spinlock);
+	spin_lock_init(&vsock->event_spinlock);
 	skb_queue_head_init(&vsock->send_pkt_queue);
 	INIT_WORK(&vsock->rx_work, virtio_transport_rx_work);
 	INIT_WORK(&vsock->tx_work, virtio_transport_tx_work);
@@ -936,7 +944,7 @@ static int __init virtio_vsock_init(void)
 {
 	int ret;
 
-	virtio_vsock_workqueue = alloc_workqueue("virtio_vsock", 0, 0);
+	virtio_vsock_workqueue = alloc_workqueue("virtio_vsock", WQ_HIGHPRI | WQ_BH, 0);
 	if (!virtio_vsock_workqueue)
 		return -ENOMEM;
 
