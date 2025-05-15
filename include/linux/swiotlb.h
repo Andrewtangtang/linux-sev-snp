@@ -29,7 +29,7 @@ struct scatterlist;
  * log of the size of each IO TLB slab.  The number of slabs is command line
  * controllable.
  */
-#define IO_TLB_SHIFT 11
+#define IO_TLB_SHIFT 12
 #define IO_TLB_SIZE (1 << IO_TLB_SHIFT)
 
 /* default to 64MB */
@@ -125,6 +125,8 @@ struct io_tlb_mem {
 #endif
 };
 
+extern struct io_tlb_mem *io_tlb_zc_mem;
+
 struct io_tlb_pool *__swiotlb_find_pool(struct device *dev, phys_addr_t paddr);
 
 /**
@@ -142,7 +144,7 @@ struct io_tlb_pool *__swiotlb_find_pool(struct device *dev, phys_addr_t paddr);
 static inline struct io_tlb_pool *swiotlb_find_pool(struct device *dev,
 		phys_addr_t paddr)
 {
-	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
+	struct io_tlb_mem *mem = dev ? dev->dma_io_tlb_mem : io_tlb_zc_mem;
 
 	if (!mem)
 		return NULL;
@@ -174,6 +176,13 @@ static inline bool is_swiotlb_force_bounce(struct device *dev)
 	struct io_tlb_mem *mem = dev->dma_io_tlb_mem;
 
 	return mem && mem->force_bounce;
+}
+
+static inline bool is_zcmem(phys_addr_t phys)
+{
+	return io_tlb_zc_mem &&
+	       io_tlb_zc_mem->defpool.start <= phys &&
+	       phys < io_tlb_zc_mem->defpool.end;
 }
 
 void swiotlb_init(bool addressing_limited, unsigned int flags);

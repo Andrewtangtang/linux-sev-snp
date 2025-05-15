@@ -973,8 +973,13 @@ void __noreturn do_exit(long code)
 	if (tsk->splice_pipe)
 		free_pipe_info(tsk->splice_pipe);
 
-	if (tsk->task_frag.page)
-		put_page(tsk->task_frag.page);
+	if (tsk->task_frag.page) {
+		phys_addr_t phys = page_to_phys(tsk->task_frag.page);
+		if (is_zcmem(phys) && page_count(tsk->task_frag.page) == 1)
+			swiotlb_tbl_unmap_single(NULL, phys, 0, DMA_NONE, 0);
+		else
+			put_page(tsk->task_frag.page);
+	}
 
 	exit_task_stack_account(tsk);
 

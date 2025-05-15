@@ -103,7 +103,8 @@ static int virtio_transport_init_zcopy_skb(struct vsock_sock *vsk,
 static int virtio_transport_fill_skb(struct sk_buff *skb,
 				     struct virtio_vsock_pkt_info *info,
 				     size_t len,
-				     int zc)
+				     int zc,
+				     struct page *page)
 {
 	if (zc == MSG_ZEROCOPY)
 		return __zerocopy_sg_from_iter(info->msg, NULL, skb,
@@ -117,7 +118,18 @@ static int virtio_transport_fill_skb(struct sk_buff *skb,
 		if (size >= 0)
 			refcount_add(size, &skb->sk->sk_wmem_alloc);
 		return size >= 0;
+	} else if (page) {
+		/* refer to unix_stream_sendmsg() */
+		int ret = copy_from_iter_full(page_address(page), len,
+					      &info->msg->msg_iter);
+		if (ret) {
+			skb_len_add(skb, len);
+			refcount_add(len, &skb->sk->sk_wmem_alloc);
+			skb_fill_page_desc(skb, 0, page, 0, len);
+		}
+		return ret;
 	} else
+		/* this won't be executed, leave it here */
 		return memcpy_from_msg(skb_put(skb, len), info->msg, len);
 }
 
@@ -264,15 +276,26 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 	struct vsock_sock *vsk;
 	struct sk_buff *skb;
 	size_t skb_len;
+	struct page *page = NULL;
 
 	skb_len = VIRTIO_VSOCK_SKB_HEADROOM;
 
-	if (!zc)
-		skb_len += payload_len;
+	// if (!zc)
+	// 	skb_len += payload_len;
 
 	skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL);
 	if (!skb)
 		return NULL;
+
+	if (payload_len) {
+		phys_addr_t phys = swiotlb_map(NULL, INVALID_PHYS_ADDR,
+					       payload_len, DMA_NONE, 0);
+		if (phys == DMA_MAPPING_ERROR) {
+			kfree(skb);
+			return NULL;
+		}
+		page = phys_to_page(phys);
+	}
 
 	virtio_transport_init_hdr(skb, info, payload_len, src_cid, src_port,
 				  dst_cid, dst_port);
@@ -296,7 +319,7 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 	if (info->msg && payload_len > 0) {
 		int err;
 
-		err = virtio_transport_fill_skb(skb, info, payload_len, zc);
+		err = virtio_transport_fill_skb(skb, info, payload_len, zc, page);
 		if (err < 0)
 			goto out;
 

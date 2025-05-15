@@ -36,11 +36,16 @@ bool napi_pp_put_page(netmem_ref netmem);
 
 static inline void skb_page_unref(netmem_ref netmem, bool recycle)
 {
+	struct page *page = netmem_to_page(netmem);
+	phys_addr_t phys = page_to_phys(page);
 #ifdef CONFIG_PAGE_POOL
 	if (recycle && napi_pp_put_page(netmem))
 		return;
 #endif
-	put_page(netmem_to_page(netmem));
+	if (is_zcmem(phys) && page_ref_count(page) == 1)
+		swiotlb_tbl_unmap_single(NULL, phys, 0, DMA_NONE, 0);
+	else
+		put_page(netmem_to_page(netmem));
 }
 
 /**
