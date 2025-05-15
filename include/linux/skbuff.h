@@ -39,6 +39,7 @@
 #include <net/net_debug.h>
 #include <net/dropreason-core.h>
 #include <net/netmem.h>
+#include <linux/swiotlb.h>
 
 /**
  * DOC: skb checksums

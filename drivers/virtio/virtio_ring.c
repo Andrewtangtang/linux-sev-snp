@@ -8,6 +8,7 @@
 #include <linux/virtio_config.h>
 #include <linux/device.h>
 #include <linux/slab.h>
+#include <linux/swiotlb.h>
 #include <linux/module.h>
 #include <linux/hrtimer.h>
 #include <linux/dma-mapping.h>
@@ -372,7 +373,7 @@ static int vring_map_one_sg(const struct vring_virtqueue *vq, struct scatterlist
 
 	*len = sg->length;
 
-	if (!vq->use_dma_api) {
+	if (!vq->use_dma_api || is_zcmem(sg_phys(sg))) {
 		/*
 		 * If DMA is not used, KMSAN doesn't know that the scatterlist
 		 * is initialized by the hardware. Explicitly check/unpoison it
@@ -448,6 +449,8 @@ static unsigned int vring_unmap_one_split(const struct vring_virtqueue *vq,
 
 	flags = extra->flags;
 
+	if (flags & VRING_DESC_F_ZC)
+		goto out;
 	if (flags & VRING_DESC_F_INDIRECT) {
 		if (!vq->use_dma_api)
 			goto out;
@@ -511,7 +514,7 @@ static inline unsigned int virtqueue_add_desc_split(struct virtqueue *vq,
 {
 	u16 next;
 
-	desc[i].flags = cpu_to_virtio16(vq->vdev, flags);
+	desc[i].flags = cpu_to_virtio16(vq->vdev, flags) & ~VRING_DESC_F_ZC;
 	desc[i].addr = cpu_to_virtio64(vq->vdev, addr);
 	desc[i].len = cpu_to_virtio32(vq->vdev, len);
 
@@ -600,6 +603,7 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
 			dma_addr_t addr;
 			u32 len;
+			u16 flags = VRING_DESC_F_NEXT;
 
 			if (vring_map_one_sg(vq, sg, DMA_TO_DEVICE, &addr, &len, premapped))
 				goto unmap_release;
@@ -608,13 +612,16 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			/* Note that we trust indirect descriptor
 			 * table since it use stream DMA mapping.
 			 */
+			if (is_zcmem(sg_phys(sg)))
+				flags |= VRING_DESC_F_ZC;
 			i = virtqueue_add_desc_split(_vq, desc, extra, i, addr, len,
-						     VRING_DESC_F_NEXT,
+						     flags,
 						     premapped);
 		}
 	}
 	for (; n < (out_sgs + in_sgs); n++) {
 		for (sg = sgs[n]; sg; sg = sg_next(sg)) {
+			u16 flags = VRING_DESC_F_NEXT | VRING_DESC_F_WRITE;
 			dma_addr_t addr;
 			u32 len;
 
@@ -625,9 +632,10 @@ static inline int virtqueue_add_split(struct virtqueue *_vq,
 			/* Note that we trust indirect descriptor
 			 * table since it use stream DMA mapping.
 			 */
+			if (is_zcmem(sg_phys(sg)))
+				flags |= VRING_DESC_F_ZC;
 			i = virtqueue_add_desc_split(_vq, desc, extra, i, addr, len,
-						     VRING_DESC_F_NEXT |
-						     VRING_DESC_F_WRITE,
+						     flags,
 						     premapped);
 		}
 	}

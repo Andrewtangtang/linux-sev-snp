@@ -43,6 +43,7 @@
 #define VRING_DESC_F_WRITE	2
 /* This means the buffer contains a list of buffer descriptors. */
 #define VRING_DESC_F_INDIRECT	4
+#define VRING_DESC_F_ZC		8
 
 /*
  * Mark a descriptor as available or used in packed ring.

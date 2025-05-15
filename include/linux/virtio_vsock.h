@@ -6,7 +6,9 @@
 #include <linux/socket.h>
 #include <net/sock.h>
 #include <net/af_vsock.h>
+#include <linux/swiotlb.h>
 
+#define INVALID_PHYS_ADDR (~(phys_addr_t)0)
 #define VIRTIO_VSOCK_SKB_HEADROOM (sizeof(struct virtio_vsock_hdr))
 
 struct virtio_vsock_skb_cb {

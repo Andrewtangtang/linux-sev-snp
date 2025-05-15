@@ -331,8 +331,17 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 		sg_init_one(&hdr, virtio_vsock_hdr(skb), VIRTIO_VSOCK_SKB_HEADROOM);
 		sgs[0] = &hdr;
 
-		page = alloc_pages(frags_flag,
-				   ilog2(VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE) - PAGE_SHIFT);
+		{
+			phys_addr_t phys;
+
+			phys = swiotlb_map(NULL, INVALID_PHYS_ADDR,
+					   VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE, DMA_NONE, 0);
+			if (phys == DMA_MAPPING_ERROR) {
+				kfree_skb(skb);
+				break;
+			}
+			page = phys_to_page(phys);
+		}
 
 		sg_init_one(&data, page_address(page), VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
 		sgs[1] = &data;
