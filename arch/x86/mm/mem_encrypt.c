@@ -134,5 +134,5 @@ void __init mem_encrypt_setup_arch(void)
 	swiotlb_adjust_size(size);
 
 	/* Set restricted memory access for virtio. */
-	virtio_set_mem_acc_cb(virtio_require_restricted_mem_acc);
+	// virtio_set_mem_acc_cb(virtio_require_restricted_mem_acc);
 }
