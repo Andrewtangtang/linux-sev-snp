@@ -1965,9 +1965,6 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 	if (skb_shared(skb) || skb_unclone(skb, gfp_mask))
 		return -EINVAL;
 
-	if (!skb_frags_readable(skb))
-		return -EFAULT;
-
 	if (!num_frags)
 		goto release;
 
@@ -2140,9 +2137,6 @@ struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)
 	struct sk_buff *n;
 	unsigned int size;
 	int headerlen;
-
-	if (!skb_frags_readable(skb))
-		return NULL;
 
 	if (WARN_ON_ONCE(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST))
 		return NULL;
@@ -2481,9 +2475,6 @@ struct sk_buff *skb_copy_expand(const struct sk_buff *skb,
 	int head_copy_len, head_copy_off;
 	struct sk_buff *n;
 	int oldheadroom;
-
-	if (!skb_frags_readable(skb))
-		return NULL;
 
 	if (WARN_ON_ONCE(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST))
 		return NULL;
@@ -2829,9 +2820,6 @@ void *__pskb_pull_tail(struct sk_buff *skb, int delta)
 	 */
 	int i, k, eat = (skb->tail + delta) - skb->end;
 
-	if (!skb_frags_readable(skb))
-		return NULL;
-
 	if (eat > 0 || skb_cloned(skb)) {
 		if (pskb_expand_head(skb, 0, eat > 0 ? eat + 128 : 0,
 				     GFP_ATOMIC))
@@ -2984,9 +2972,6 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 		offset += copy;
 		to     += copy;
 	}
-
-	if (!skb_frags_readable(skb))
-		goto fault;
 
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
@@ -3176,9 +3161,6 @@ static bool __skb_splice_bits(struct sk_buff *skb, struct pipe_inode_info *pipe,
 	/*
 	 * then map the fragments
 	 */
-	if (!skb_frags_readable(skb))
-		return false;
-
 	for (seg = 0; seg < skb_shinfo(skb)->nr_frags; seg++) {
 		const skb_frag_t *f = &skb_shinfo(skb)->frags[seg];
 
@@ -3399,9 +3381,6 @@ int skb_store_bits(struct sk_buff *skb, int offset, const void *from, int len)
 		from += copy;
 	}
 
-	if (!skb_frags_readable(skb))
-		goto fault;
-
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 		int end;
@@ -3480,9 +3459,6 @@ __wsum __skb_checksum(const struct sk_buff *skb, int offset, int len,
 		offset += copy;
 		pos	= copy;
 	}
-
-	if (WARN_ON_ONCE(!skb_frags_readable(skb)))
-		return 0;
 
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
@@ -3583,9 +3559,6 @@ __wsum skb_copy_and_csum_bits(const struct sk_buff *skb, int offset,
 		to     += copy;
 		pos	= copy;
 	}
-
-	if (!skb_frags_readable(skb))
-		return 0;
 
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
@@ -4078,7 +4051,6 @@ static inline void skb_split_inside_header(struct sk_buff *skb,
 		skb_shinfo(skb1)->frags[i] = skb_shinfo(skb)->frags[i];
 
 	skb_shinfo(skb1)->nr_frags = skb_shinfo(skb)->nr_frags;
-	skb1->unreadable	   = skb->unreadable;
 	skb_shinfo(skb)->nr_frags  = 0;
 	skb1->data_len		   = skb->data_len;
 	skb1->len		   += skb1->data_len;
@@ -4126,8 +4098,6 @@ static inline void skb_split_no_header(struct sk_buff *skb,
 		pos += size;
 	}
 	skb_shinfo(skb1)->nr_frags = k;
-
-	skb1->unreadable = skb->unreadable;
 }
 
 /**
@@ -4364,9 +4334,6 @@ next_skb:
 		*data = st->cur_skb->data + (abs_offset - st->stepped_offset);
 		return block_limit - abs_offset;
 	}
-
-	if (!skb_frags_readable(st->cur_skb))
-		return 0;
 
 	if (st->frag_idx == 0 && !st->frag_data)
 		st->stepped_offset += skb_headlen(st->cur_skb);
@@ -6015,10 +5982,7 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 	if (to->pp_recycle != from->pp_recycle)
 		return false;
 
-	if (skb_frags_readable(from) != skb_frags_readable(to))
-		return false;
-
-	if (len <= skb_tailroom(to) && skb_frags_readable(from)) {
+	if (len <= skb_tailroom(to)) {
 		if (len)
 			BUG_ON(skb_copy_bits(from, 0, skb_put(to, len), len));
 		*delta_truesize = 0;
@@ -6194,9 +6158,6 @@ int skb_ensure_writable(struct sk_buff *skb, unsigned int write_len)
 {
 	if (!pskb_may_pull(skb, write_len))
 		return -ENOMEM;
-
-	if (!skb_frags_readable(skb))
-		return -EFAULT;
 
 	if (!skb_cloned(skb) || skb_clone_writable(skb, write_len))
 		return 0;
@@ -6877,7 +6838,7 @@ void skb_condense(struct sk_buff *skb)
 {
 	if (skb->data_len) {
 		if (skb->data_len > skb->end - skb->tail ||
-		    skb_cloned(skb) || !skb_frags_readable(skb))
+		    skb_cloned(skb))
 			return;
 
 		/* Nice, we can free page frag(s) right now */
