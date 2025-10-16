@@ -34,13 +34,14 @@ static inline void skb_frag_ref(struct sk_buff *skb, int f)
 
 bool napi_pp_put_page(netmem_ref netmem);
 
-static inline void skb_page_unref(netmem_ref netmem, bool recycle)
+static inline void
+skb_page_unref(struct page *page, bool recycle)
 {
 #ifdef CONFIG_PAGE_POOL
-	if (recycle && napi_pp_put_page(netmem))
+	if (recycle && napi_pp_put_page(page_to_netmem(page)))
 		return;
 #endif
-	put_page(netmem_to_page(netmem));
+	put_page(page);
 }
 
 /**
@@ -53,7 +54,7 @@ static inline void skb_page_unref(netmem_ref netmem, bool recycle)
  */
 static inline void __skb_frag_unref(skb_frag_t *frag, bool recycle)
 {
-	skb_page_unref(skb_frag_netmem(frag), recycle);
+	skb_page_unref(skb_frag_page(frag), recycle);
 }
 
 /**
