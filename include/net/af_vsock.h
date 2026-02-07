@@ -17,7 +17,7 @@
 
 #define LAST_RESERVED_PORT 1023
 
-#define VSOCK_HASH_SIZE         251
+#define VSOCK_HASH_SIZE         524287
 extern struct list_head vsock_bind_table[VSOCK_HASH_SIZE + 1];
 extern struct list_head vsock_connected_table[VSOCK_HASH_SIZE];
 extern spinlock_t vsock_table_lock;

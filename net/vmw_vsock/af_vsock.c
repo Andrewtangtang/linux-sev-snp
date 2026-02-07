@@ -173,7 +173,7 @@ static DEFINE_MUTEX(vsock_register_mutex);
 
 /* XXX This can probably be implemented in a better way. */
 #define VSOCK_CONN_HASH(src, dst)				\
-	(((src)->svm_cid ^ (dst)->svm_port) % VSOCK_HASH_SIZE)
+	(((src)->svm_cid ^ (dst)->svm_port ^ (src)->svm_port) % VSOCK_HASH_SIZE)
 #define vsock_connected_sockets(src, dst)		\
 	(&vsock_connected_table[VSOCK_CONN_HASH(src, dst)])
 #define vsock_connected_sockets_vsk(vsk)				\
@@ -2080,17 +2080,16 @@ static int vsock_connectible_wait_data(struct sock *sk,
 	struct vsock_sock *vsk;
 	s64 data;
 	int err;
+	bool has_wait = false;
 
 	vsk = vsock_sk(sk);
 	err = 0;
 	transport = vsk->transport;
 
-	while (1) {
-		prepare_to_wait(sk_sleep(sk), wait, TASK_INTERRUPTIBLE);
-		data = vsock_connectible_has_data(vsk);
-		if (data != 0)
-			break;
+	while (!(data = vsock_connectible_has_data(vsk))) {
+		has_wait = true;
 
+		prepare_to_wait(sk_sleep(sk), wait, TASK_INTERRUPTIBLE);
 		if (sk->sk_err != 0 ||
 		    (sk->sk_shutdown & RCV_SHUTDOWN) ||
 		    (vsk->peer_shutdown & SEND_SHUTDOWN)) {
@@ -2122,7 +2121,8 @@ static int vsock_connectible_wait_data(struct sock *sk,
 		}
 	}
 
-	finish_wait(sk_sleep(sk), wait);
+	if (has_wait)
+		finish_wait(sk_sleep(sk), wait);
 
 	if (err)
 		return err;
