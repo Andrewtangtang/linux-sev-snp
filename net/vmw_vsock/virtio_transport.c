@@ -251,6 +251,15 @@ static int virtio_transport_send_skb_fast_path(struct virtio_vsock *vsock, struc
 	/* Inside RCU, can't sleep! */
 	spin_lock_bh(&tq->tx_spinlock);
 
+	do {
+		struct sk_buff *skb;
+		unsigned int len;
+
+		virtqueue_disable_cb(vq);
+		while ((skb = virtqueue_get_buf(vq, &len)) != NULL)
+			virtio_transport_consume_skb_sent(skb, true);
+	} while (!virtqueue_enable_cb(vq));
+
 	ret = virtio_transport_send_skb(skb, vq, vsock, GFP_ATOMIC);
 	if (ret == 0)
 		virtqueue_kick(vq);
