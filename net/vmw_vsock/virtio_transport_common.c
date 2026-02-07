@@ -665,7 +665,7 @@ virtio_transport_stream_do_dequeue(struct vsock_sock *vsk,
 	fwd_cnt_delta = vvs->fwd_cnt - vvs->last_fwd_cnt;
 	free_space = vvs->buf_alloc - fwd_cnt_delta;
 	low_rx_bytes = (vvs->rx_bytes <
-			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX));
+			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX) && vvs->rx_bytes > 0);
 
 	spin_unlock_bh(&vvs->rx_lock);
 
@@ -884,11 +884,7 @@ s64 virtio_transport_stream_has_data(struct vsock_sock *vsk)
 	struct virtio_vsock_sock *vvs = vsk->trans;
 	s64 bytes;
 
-	spin_lock_bh(&vvs->rx_lock);
-	bytes = vvs->rx_bytes;
-	spin_unlock_bh(&vvs->rx_lock);
-
-	return bytes;
+	return vvs->rx_bytes;
 }
 EXPORT_SYMBOL_GPL(virtio_transport_stream_has_data);
 
@@ -922,9 +918,7 @@ s64 virtio_transport_stream_has_space(struct vsock_sock *vsk)
 	struct virtio_vsock_sock *vvs = vsk->trans;
 	s64 bytes;
 
-	spin_lock_bh(&vvs->tx_lock);
 	bytes = virtio_transport_has_space(vsk);
-	spin_unlock_bh(&vvs->tx_lock);
 
 	return bytes;
 }
@@ -1795,7 +1789,7 @@ int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t recv_acto
 	fwd_cnt_delta = vvs->fwd_cnt - vvs->last_fwd_cnt;
 	free_space = vvs->buf_alloc - fwd_cnt_delta;
 	low_rx_bytes = (vvs->rx_bytes <
-			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX));
+			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX) && vvs->rx_bytes > 0);
 	spin_unlock_bh(&vvs->rx_lock);
 
 	if (fwd_cnt_delta &&
