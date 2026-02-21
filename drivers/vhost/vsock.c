@@ -47,23 +47,50 @@ MODULE_PARM_DESC(busyloop_timeout_us,
 	"Default busy poll timeout in microseconds for all vqs (0 = disabled)");
 
 /* Used to track all the vhost_vsock instances on the system. */
-static DEFINE_MUTEX(vhost_vsock_mutex);
-static DEFINE_READ_MOSTLY_HASHTABLE(vhost_vsock_hash, 8);
+static DEFINE_MUTEX(vhost_vsock_pool_mutex);
+static DEFINE_READ_MOSTLY_HASHTABLE(vhost_vsock_pool_hash, 8);
 
 struct vhost_vsock {
 	struct vhost_dev dev;
 	struct vhost_virtqueue vqs[2];
 
-	/* Link to global vhost_vsock_hash, writes use vhost_vsock_mutex */
-	struct hlist_node hash;
-
 	struct vhost_work send_pkt_work;
 	struct sk_buff_head send_pkt_queue; /* host->guest pending packets */
 
 	atomic_t queued_replies;
-
 	u32 guest_cid;
 	bool seqpacket_allow;
+
+	struct vhost_vsock_pool *vsock_pool;
+	u16 idx;
+};
+
+#define VHOST_VSOCK_MAX_NUM 256
+/* This new data structure is required since in `vhost_transport_send_pkt`,
+ * we need to acquire the corresponding `struct vhost_vsock` based on
+ * `skb->queue_mapping`. Therefore, we need a data structure holding an array of
+ * `struct vhost_vsock`.
+ */
+struct vhost_vsock_pool {
+	/* The lock protectes vsock_pool, vsock_pool_num, is_closed. */
+	spinlock_t pool_lock;
+	/* A temporary workaround. A more reasonable approach is to use a
+	 * dyanmic-size array.
+	 */
+	struct vhost_vsock __rcu *vsock_pool[VHOST_VSOCK_MAX_NUM];
+	u16 vsock_pool_num;
+	/* For simplicity, while removing elements from vsock_pool, disallow
+	 * all underlying transmission. When closing a vhost_vsocks, users
+	 * should close all vhost_vsock having same guest_cid at once.
+	 *
+	 * Otherwise, we need to handle cases that only part of vsock_pool is
+	 * removed while other are not.
+	 */
+	bool is_closed;
+
+	/* Link to global vhost_vsock_pool_hash, writes use vhost_vsock_mutex */
+	struct hlist_node hash;
+	u32 guest_cid;
 };
 
 static u32 vhost_transport_get_local_cid(void)
@@ -74,19 +101,19 @@ static u32 vhost_transport_get_local_cid(void)
 /* Callers that dereference the return value must hold vhost_vsock_mutex or the
  * RCU read lock.
  */
-static struct vhost_vsock *vhost_vsock_get(u32 guest_cid)
+static struct vhost_vsock_pool *vhost_vsock_pool_get(u32 guest_cid)
 {
-	struct vhost_vsock *vsock;
+	struct vhost_vsock_pool *vsock_pool;
 
-	hash_for_each_possible_rcu(vhost_vsock_hash, vsock, hash, guest_cid) {
-		u32 other_cid = vsock->guest_cid;
+	hash_for_each_possible_rcu(vhost_vsock_pool_hash, vsock_pool, hash, guest_cid) {
+		u32 other_cid = vsock_pool->guest_cid;
 
 		/* Skip instances that have no CID yet */
 		if (other_cid == 0)
 			continue;
 
 		if (other_cid == guest_cid)
-			return vsock;
+			return vsock_pool;
 
 	}
 
@@ -418,18 +445,28 @@ static int
 vhost_transport_send_pkt(struct sk_buff *skb)
 {
 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+	struct vhost_vsock_pool *vsock_pool;
 	struct vhost_vsock *vsock;
 	int len = skb->len;
+	u16 queue_idx;
 
 	rcu_read_lock();
 
 	/* Find the vhost_vsock according to guest context id  */
-	vsock = vhost_vsock_get(le64_to_cpu(hdr->dst_cid));
-	if (!vsock) {
+	vsock_pool = vhost_vsock_pool_get(le64_to_cpu(hdr->dst_cid));
+	if (!vsock_pool) {
 		rcu_read_unlock();
 		kfree_skb(skb);
 		return -ENODEV;
 	}
+
+	spin_lock(&vsock_pool->pool_lock);
+	queue_idx = skb->hash % vsock_pool->vsock_pool_num;
+	vsock = rcu_dereference(vsock_pool->vsock_pool[queue_idx]);
+	spin_unlock(&vsock_pool->pool_lock);
+
+	if (!vsock)
+		return -ENODEV;
 
 	if (virtio_vsock_skb_reply(skb))
 		atomic_inc(&vsock->queued_replies);
@@ -444,6 +481,7 @@ vhost_transport_send_pkt(struct sk_buff *skb)
 static int
 vhost_transport_cancel_pkt(struct vsock_sock *vsk)
 {
+	struct vhost_vsock_pool *vsock_pool;
 	struct vhost_vsock *vsock;
 	int cnt = 0;
 	int ret = -ENODEV;
@@ -451,10 +489,11 @@ vhost_transport_cancel_pkt(struct vsock_sock *vsk)
 	rcu_read_lock();
 
 	/* Find the vhost_vsock according to guest context id  */
-	vsock = vhost_vsock_get(vsk->remote_addr.svm_cid);
-	if (!vsock)
+	vsock_pool = vhost_vsock_pool_get(vsk->remote_addr.svm_cid);
+	if (!vsock_pool)
 		goto out;
 
+	vsock = vsock_pool->vsock_pool[0];
 	cnt = virtio_transport_purge_skbs(vsk, &vsock->send_pkt_queue);
 
 	if (cnt) {
@@ -626,14 +665,14 @@ static struct virtio_transport vhost_transport = {
 
 static bool vhost_transport_seqpacket_allow(u32 remote_cid)
 {
-	struct vhost_vsock *vsock;
+	struct vhost_vsock_pool *vsock_pool;
 	bool seqpacket_allow = false;
 
 	rcu_read_lock();
-	vsock = vhost_vsock_get(remote_cid);
+	vsock_pool = vhost_vsock_pool_get(remote_cid);
 
-	if (vsock)
-		seqpacket_allow = vsock->seqpacket_allow;
+	if (vsock_pool)
+		seqpacket_allow = vsock_pool->vsock_pool[0]->seqpacket_allow;
 
 	rcu_read_unlock();
 
@@ -887,7 +926,7 @@ static void vhost_vsock_reset_orphans(struct sock *sk)
 	 */
 
 	/* If the peer is still valid, no need to reset connection */
-	if (vhost_vsock_get(vsk->remote_addr.svm_cid))
+	if (vhost_vsock_pool_get(vsk->remote_addr.svm_cid))
 		return;
 
 	/* If the close timeout is pending, let it expire.  This avoids races
@@ -906,11 +945,19 @@ static void vhost_vsock_reset_orphans(struct sock *sk)
 static int vhost_vsock_dev_release(struct inode *inode, struct file *file)
 {
 	struct vhost_vsock *vsock = file->private_data;
+	struct vhost_vsock_pool *vsock_pool = vsock->vsock_pool;
 
-	mutex_lock(&vhost_vsock_mutex);
-	if (vsock->guest_cid)
-		hash_del_rcu(&vsock->hash);
-	mutex_unlock(&vhost_vsock_mutex);
+	mutex_lock(&vhost_vsock_pool_mutex);
+	if (vsock->guest_cid) {
+		spin_lock(&vsock_pool->pool_lock);
+		rcu_assign_pointer(vsock_pool->vsock_pool[vsock->idx], NULL);
+		vsock_pool->vsock_pool_num--;
+		vsock_pool->is_closed = true;
+		if (!vsock_pool->vsock_pool_num)
+			hash_del_rcu(&vsock_pool->hash);
+		spin_unlock(&vsock_pool->pool_lock);
+	}
+	mutex_unlock(&vhost_vsock_pool_mutex);
 
 	/* Wait for other CPUs to finish using vsock */
 	synchronize_rcu();
@@ -934,12 +981,19 @@ static int vhost_vsock_dev_release(struct inode *inode, struct file *file)
 	vhost_dev_cleanup(&vsock->dev);
 	kfree(vsock->dev.vqs);
 	vhost_vsock_free(vsock);
+
+	spin_lock(&vsock_pool->pool_lock);
+	if (!vsock_pool->vsock_pool_num)
+		kfree(vsock_pool);
+	spin_unlock(&vsock_pool->pool_lock);
 	return 0;
 }
 
+/* Should be called as the last step. */
 static int vhost_vsock_set_cid(struct vhost_vsock *vsock, u64 guest_cid)
 {
-	struct vhost_vsock *other;
+	int ret = 0;
+	struct vhost_vsock_pool *other;
 
 	/* Refuse reserved CIDs */
 	if (guest_cid <= VMADDR_CID_HOST ||
@@ -956,22 +1010,41 @@ static int vhost_vsock_set_cid(struct vhost_vsock *vsock, u64 guest_cid)
 	if (vsock_find_cid(guest_cid))
 		return -EADDRINUSE;
 
-	/* Refuse if CID is already in use */
-	mutex_lock(&vhost_vsock_mutex);
-	other = vhost_vsock_get(guest_cid);
-	if (other && other != vsock) {
-		mutex_unlock(&vhost_vsock_mutex);
-		return -EADDRINUSE;
+	/* If CID is already in use, push it into the vsock_pool */
+	mutex_lock(&vhost_vsock_pool_mutex);
+	other = vhost_vsock_pool_get(guest_cid);
+
+	if (!other) {
+		other = kvmalloc(sizeof(*vsock), GFP_KERNEL | __GFP_RETRY_MAYFAIL);
+		if (!other) {
+			ret = -ENOMEM;
+			goto out_mutex;
+		}
+		memset(other, 0, sizeof(*other));
+		spin_lock_init(&other->pool_lock);
+		other->guest_cid = guest_cid;
+		hash_add_rcu(vhost_vsock_pool_hash, &other->hash, other->guest_cid);
 	}
 
-	if (vsock->guest_cid)
-		hash_del_rcu(&vsock->hash);
-
 	vsock->guest_cid = guest_cid;
-	hash_add_rcu(vhost_vsock_hash, &vsock->hash, vsock->guest_cid);
-	mutex_unlock(&vhost_vsock_mutex);
 
-	return 0;
+	spin_lock(&other->pool_lock);
+	if (other->is_closed) {
+		pr_err("Some vsock in the pool with guest_cid:%llu is closing. \
+			Disable vhost_vsock creation to prevent complicated \
+			situation", guest_cid);
+		ret = -EINVAL;
+		goto out_nested;
+	}
+	vsock->idx = other->vsock_pool_num;
+	vsock->vsock_pool = other;
+	rcu_assign_pointer(other->vsock_pool[other->vsock_pool_num++], vsock);
+out_nested:
+	spin_unlock(&other->pool_lock);
+out_mutex:
+	mutex_unlock(&vhost_vsock_pool_mutex);
+
+	return ret;
 }
 
 static int vhost_vsock_set_features(struct vhost_vsock *vsock, u64 features)
