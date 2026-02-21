@@ -289,6 +289,8 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
 
 	/* Set owner here, because '__zerocopy_sg_from_iter()' uses
 	 * owner of skb without check to update 'sk_wmem_alloc'.
+	 *
+	 * Notice that skb->hash is set during `skb_set_owner_w`.
 	 */
 	if (vsk)
 		skb_set_owner_w(skb, sk_vsock(vsk));
@@ -1334,6 +1336,7 @@ virtio_transport_recv_connecting(struct sock *sk,
 		sk->sk_socket->state = SS_CONNECTED;
 		vsock_insert_connected(vsk);
 		sk->sk_state_change(sk);
+		sk_set_txhash(sk);
 		break;
 	case VIRTIO_VSOCK_OP_INVALID:
 		break;
@@ -1585,6 +1588,7 @@ virtio_transport_recv_listen(struct sock *sk, struct sk_buff *skb,
 	release_sock(child);
 
 	sk->sk_data_ready(sk);
+	sk_set_txhash(sk);
 	return 0;
 }
 
