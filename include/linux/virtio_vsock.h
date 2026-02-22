@@ -136,6 +136,29 @@ enum {
 	VSOCK_VQ_MAX    = 3,
 };
 
+ #define VIRTIO_VSOCK_VQ_PAIRS_MIN        1
+ #define VIRTIO_VSOCK_VQ_PAIRS_MAX        0x8000
+
+static int vq2txq(struct virtqueue *vq)
+{
+	return (vq->index - 1) / 2;
+}
+
+static int txq2vq(int txq)
+{
+	return txq * 2 + 1;
+}
+
+static int vq2rxq(struct virtqueue *vq)
+{
+	return vq->index / 2;
+}
+
+static int rxq2vq(int rxq)
+{
+	return rxq * 2;
+}
+
 /* Per-socket state (accessed via vsk->trans) */
 struct virtio_vsock_sock {
 	struct vsock_sock *vsk;
