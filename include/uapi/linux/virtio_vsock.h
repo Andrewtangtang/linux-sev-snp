@@ -40,9 +40,15 @@
 
 /* The feature bitmap for virtio vsock */
 #define VIRTIO_VSOCK_F_SEQPACKET	1	/* SOCK_SEQPACKET supported */
+/* For better compatibility, a feature bit indicating whether mq is enabled
+ * should be introduced. However, the current QEMU and crosvm patch series
+ * does not support this bit yet.
+ */
+#define VIRTIO_VSOCK_F_MQ		2	/* multi-queue supported */
 
 struct virtio_vsock_config {
 	__le64 guest_cid;
+	__le64 max_virtqueue_pairs;
 } __attribute__((packed));
 
 enum virtio_vsock_event_id {
