@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
+#include <linux/sched/clock.h>
 #include <net/sock.h>
 #include <linux/virtio_vsock.h>
 #include <linux/vhost.h>
@@ -39,6 +40,11 @@ enum {
 enum {
 	VHOST_VSOCK_BACKEND_FEATURES = (1ULL << VHOST_BACKEND_F_IOTLB_MSG_V2)
 };
+
+static unsigned int busyloop_timeout_us;
+module_param(busyloop_timeout_us, uint, 0644);
+MODULE_PARM_DESC(busyloop_timeout_us,
+	"Default busy poll timeout in microseconds for all vqs (0 = disabled)");
 
 /* Used to track all the vhost_vsock instances on the system. */
 static DEFINE_MUTEX(vhost_vsock_mutex);
@@ -85,6 +91,76 @@ static struct vhost_vsock *vhost_vsock_get(u32 guest_cid)
 	}
 
 	return NULL;
+}
+
+static inline unsigned long busy_clock(void)
+{
+	return local_clock() >> 10;
+}
+
+static bool vhost_can_busy_poll(unsigned long endtime)
+{
+	return likely(!need_resched() &&
+		      !time_after(busy_clock(), endtime) &&
+		      !signal_pending(current));
+}
+
+/*
+ * Busy-poll both virtqueues for a bounded period.
+ *
+ * We must hold the paired vq's mutex while calling vhost_vq_avail_empty()
+ * on it, because vhost_get_avail_idx() writes to vq->avail_idx.
+ * This matches vhost-net's approach (net.c:556).
+ */
+static void vhost_vsock_busy_poll(struct vhost_vsock *vsock,
+				  struct vhost_virtqueue *vq,
+				  bool *busyloop_intr)
+{
+	struct vhost_virtqueue *tx_vq = &vsock->vqs[VSOCK_VQ_TX];
+	struct vhost_virtqueue *rx_vq = &vsock->vqs[VSOCK_VQ_RX];
+	struct vhost_virtqueue *paired_vq;
+	unsigned long endtime;
+	u32 timeout;
+
+	timeout = vq->busyloop_timeout;
+	if (!timeout)
+		return;
+
+	paired_vq = (vq == rx_vq) ? tx_vq : rx_vq;
+
+	if (!mutex_trylock(&paired_vq->mutex))
+		return;
+	vhost_disable_notify(&vsock->dev, paired_vq);
+
+	preempt_disable();
+	endtime = busy_clock() + timeout;
+
+	while (vhost_can_busy_poll(endtime)) {
+		if (vhost_vq_has_work(vq)) {
+			*busyloop_intr = true;
+			break;
+		}
+
+		if (!vhost_vq_avail_empty(&vsock->dev, tx_vq))
+			break;
+
+		if (!skb_queue_empty(&vsock->send_pkt_queue) &&
+		    !vhost_vq_avail_empty(&vsock->dev, rx_vq))
+			break;
+
+		cpu_relax();
+	}
+
+	preempt_enable();
+
+	if (!vhost_vq_avail_empty(&vsock->dev, paired_vq)) {
+		vhost_poll_queue(&paired_vq->poll);
+	} else if (unlikely(vhost_enable_notify(&vsock->dev, paired_vq))) {
+		vhost_disable_notify(&vsock->dev, paired_vq);
+		vhost_poll_queue(&paired_vq->poll);
+	}
+
+	mutex_unlock(&paired_vq->mutex);
 }
 
 static int fill_payload_to_iov_iter(struct vhost_vsock *vsock,
@@ -189,6 +265,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 	int pkts = 0, total_len = 0;
 	bool restart_tx = false;
 	bool queue_is_empty = false;
+	bool busyloop_intr = false;
 	bool added = false;
 
 	mutex_lock(&vq->mutex);
@@ -215,17 +292,31 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 		queue_is_empty = false;
 
 		if (skb_queue_empty(&vsock->send_pkt_queue)) {
+			if (vq->busyloop_timeout) {
+				vhost_vsock_busy_poll(vsock, vq,
+						      &busyloop_intr);
+				if (!skb_queue_empty(&vsock->send_pkt_queue))
+					goto have_pkt;
+			}
 			queue_is_empty = true;
 			break;
 		}
-
+have_pkt:
 		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
 					 &out, &in, NULL, NULL);
 		if (head < 0)
 			break;
 
-
 		if (head == vq->num) {
+			if (vq->busyloop_timeout) {
+				vhost_vsock_busy_poll(vsock, vq,
+						      &busyloop_intr);
+				head = vhost_get_vq_desc(vq, vq->iov,
+					ARRAY_SIZE(vq->iov),
+					&out, &in, NULL, NULL);
+				if (head >= 0 && head != vq->num)
+					goto got_desc;
+			}
 			/* We cannot finish yet if more buffers snuck in while
 			 * re-enabling notify.
 			 */
@@ -235,6 +326,7 @@ vhost_transport_do_send_pkt(struct vhost_vsock *vsock,
 			}
 			break;
 		}
+got_desc:
 
 		if (out) {
 			vq_err(vq, "Expected 0 output buffers, got %u\n", out);
@@ -306,6 +398,9 @@ out:
 
 	if (restart_tx)
 		vhost_poll_queue(&tx_vq->poll);
+
+	if (unlikely(busyloop_intr))
+		vhost_vq_work_queue(vq, &vsock->send_pkt_work);
 }
 
 static void vhost_transport_send_pkt_work(struct vhost_work *work)
@@ -554,6 +649,7 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 	int head, pkts = 0, total_len = 0;
 	unsigned int out, in;
 	struct sk_buff *skb;
+	bool busyloop_intr = false;
 	bool added = false;
 
 	mutex_lock(&vq->mutex);
@@ -582,13 +678,22 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 			break;
 
 		if (head == vq->num) {
+			if (vq->busyloop_timeout) {
+				vhost_vsock_busy_poll(vsock, vq,
+						      &busyloop_intr);
+				head = vhost_get_vq_desc(vq, vq->iov,
+					ARRAY_SIZE(vq->iov),
+					&out, &in, NULL, NULL);
+				if (head >= 0 && head != vq->num)
+					goto process;
+			}
 			if (unlikely(vhost_enable_notify(&vsock->dev, vq))) {
 				vhost_disable_notify(&vsock->dev, vq);
 				continue;
 			}
 			break;
 		}
-
+process:
 		skb = vhost_vsock_alloc_skb(vq, out, in);
 		if (!skb) {
 			vq_err(vq, "Faulted on pkt\n");
@@ -617,6 +722,9 @@ static void vhost_vsock_handle_tx_kick(struct vhost_work *work)
 no_more_replies:
 	if (added)
 		vhost_signal(&vsock->dev, vq);
+
+	if (unlikely(busyloop_intr))
+		vhost_poll_queue(&vq->poll);
 
 out:
 	mutex_unlock(&vq->mutex);
@@ -660,6 +768,8 @@ static int vhost_vsock_start(struct vhost_vsock *vsock)
 			if (ret)
 				goto err_vq;
 		}
+
+		vq->busyloop_timeout = busyloop_timeout_us;
 
 		mutex_unlock(&vq->mutex);
 	}
