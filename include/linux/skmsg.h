@@ -118,7 +118,11 @@ struct sk_psock {
 	struct sock			*sk_pair;
 	struct rcu_work			rwork;
 	bool				is_running;
+	struct list_head		poll_node;
+	bool				on_poll_list;
 };
+
+void psock_aggregator_remove(struct sk_psock *psock);
 
 int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
 		 int elem_first_coalesce);

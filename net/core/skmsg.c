@@ -12,6 +12,26 @@
 
 static struct workqueue_struct *psock_wq;
 
+static struct {
+	struct list_head	poll_list;
+	spinlock_t		poll_lock;
+	struct work_struct	work;
+} psock_aggregator;
+
+static void psock_aggregator_work_fn(struct work_struct *work);
+
+static void psock_aggregator_enqueue(struct sk_psock *psock)
+{
+	spin_lock_bh(&psock_aggregator.poll_lock);
+	if (!psock->on_poll_list) {
+		list_add_tail(&psock->poll_node,
+			      &psock_aggregator.poll_list);
+		psock->on_poll_list = true;
+	}
+	spin_unlock_bh(&psock_aggregator.poll_lock);
+	queue_work(psock_wq, &psock_aggregator.work);
+}
+
 static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
 {
 	if (msg->sg.end > msg->sg.start &&
@@ -632,19 +652,20 @@ static int sk_psock_handle_skb(struct sk_psock *psock, struct sk_buff *skb,
 	return err;
 }
 
-static void sk_psock_backlog(struct work_struct *work)
+/*
+ * Process up to @budget skbs from psock->ingress_skb.
+ * Caller must hold psock->work_mutex.
+ * Returns true if more work remains (EAGAIN or budget exhausted).
+ */
+static bool __sk_psock_backlog_process(struct sk_psock *psock, int budget)
 {
-	struct delayed_work *dwork = to_delayed_work(work);
-	struct sk_psock *psock = container_of(dwork, struct sk_psock, work);
-	struct sk_buff *skb = NULL;
-	u32 len = 0, off = 0;
+	struct sk_buff *skb;
+	u32 len, off;
 	bool ingress;
+	int count = 0;
 	int ret;
 
-	mutex_lock(&psock->work_mutex);
-
 	while ((skb = skb_peek(&psock->ingress_skb))) {
-		psock->is_running = true;
 		len = skb->len;
 		off = 0;
 		if (skb_bpf_strparser(skb)) {
@@ -661,21 +682,12 @@ static void sk_psock_backlog(struct work_struct *work)
 				ret = sk_psock_handle_skb(psock, skb, off,
 							  len, ingress);
 			if (ret <= 0) {
-				if (ret == -EAGAIN) {
-					/* Delay slightly to prioritize any
-					 * other work that might be here.
-					 */
-					if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
-						if (delayed_work_pending(&psock->work))
-							goto end;
-						queue_delayed_work(psock_wq, &psock->work, 0);
-					}
-					goto end;
-				}
+				if (ret == -EAGAIN)
+					return true;
 				/* Hard errors break pipe and stop xmit. */
 				sk_psock_report_error(psock, ret ? -ret : EPIPE);
 				sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
-				goto end;
+				return false;
 			}
 			off += ret;
 			len -= ret;
@@ -683,10 +695,107 @@ static void sk_psock_backlog(struct work_struct *work)
 
 		skb = skb_dequeue(&psock->ingress_skb);
 		kfree_skb(skb);
-		psock->is_running = false;
+
+		if (++count >= budget)
+			return !skb_queue_empty_lockless(&psock->ingress_skb);
 	}
-end:
+
+	return false;
+}
+
+static void sk_psock_backlog(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct sk_psock *psock = container_of(dwork, struct sk_psock, work);
+
+	mutex_lock(&psock->work_mutex);
+	psock->is_running = true;
+
+	if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
+		__sk_psock_backlog_process(psock, INT_MAX);
+
+	psock->is_running = false;
 	mutex_unlock(&psock->work_mutex);
+}
+
+#define PSOCK_AGG_BUDGET_PER	16
+#define PSOCK_AGG_BUDGET_TOTAL	256
+
+static struct sk_psock *aggregator_pick_next(void)
+{
+	struct sk_psock *psock = NULL;
+
+	spin_lock_bh(&psock_aggregator.poll_lock);
+	while (!list_empty(&psock_aggregator.poll_list)) {
+		psock = list_first_entry(&psock_aggregator.poll_list,
+					 struct sk_psock, poll_node);
+		list_del_init(&psock->poll_node);
+		if (refcount_inc_not_zero(&psock->refcnt))
+			break;
+		psock->on_poll_list = false;
+		psock = NULL;
+	}
+	spin_unlock_bh(&psock_aggregator.poll_lock);
+	return psock;
+}
+
+static void psock_aggregator_work_fn(struct work_struct *work)
+{
+	struct sk_psock *psock;
+	int total = 0;
+
+	while ((psock = aggregator_pick_next()) != NULL) {
+		bool requeue = false;
+
+		if (!mutex_trylock(&psock->work_mutex)) {
+			requeue = true;
+			goto put;
+		}
+
+		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+			psock->is_running = true;
+			requeue = __sk_psock_backlog_process(psock,
+						PSOCK_AGG_BUDGET_PER);
+			psock->is_running = false;
+		}
+
+		mutex_unlock(&psock->work_mutex);
+put:
+		spin_lock_bh(&psock_aggregator.poll_lock);
+		if (requeue &&
+		    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+			list_add_tail(&psock->poll_node,
+				      &psock_aggregator.poll_list);
+		} else {
+			psock->on_poll_list = false;
+			/* Ensure on_poll_list=false is visible to other
+			 * CPUs before we re-check ingress_skb.  Pairs
+			 * with the implicit barrier in skb_queue_tail's
+			 * spinlock release on the softirq side.
+			 */
+			smp_mb();
+			/* Re-check: a softirq may have enqueued an skb
+			 * between our last skb_peek returning NULL and
+			 * setting on_poll_list = false.  The softirq saw
+			 * on_poll_list == true and skipped the enqueue
+			 * call, so we must catch it here.
+			 */
+			if (!skb_queue_empty_lockless(&psock->ingress_skb) &&
+			    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+				list_add_tail(&psock->poll_node,
+					      &psock_aggregator.poll_list);
+				psock->on_poll_list = true;
+			}
+		}
+		spin_unlock_bh(&psock_aggregator.poll_lock);
+
+		sk_psock_put(psock->sk, psock);
+
+		if (++total >= PSOCK_AGG_BUDGET_TOTAL) {
+			queue_work(psock_wq, &psock_aggregator.work);
+			return;
+		}
+	}
 }
 
 struct sk_psock *sk_psock_init(struct sock *sk, int node)
@@ -728,6 +837,8 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 	mutex_init(&psock->work_mutex);
 	INIT_LIST_HEAD(&psock->ingress_msg);
 	spin_lock_init(&psock->ingress_lock);
+	INIT_LIST_HEAD(&psock->poll_node);
+	psock->on_poll_list = false;
 	skb_queue_head_init(&psock->ingress_skb);
 
 	sk_psock_set_state(psock, SK_PSOCK_TX_ENABLED);
@@ -809,6 +920,16 @@ static void sk_psock_destroy(struct work_struct *work)
 
 	sk_psock_done_strp(psock);
 
+	/* Remove from aggregator poll_list and wait for processing */
+	spin_lock_bh(&psock_aggregator.poll_lock);
+	if (psock->on_poll_list) {
+		list_del_init(&psock->poll_node);
+		psock->on_poll_list = false;
+	}
+	spin_unlock_bh(&psock_aggregator.poll_lock);
+	mutex_lock(&psock->work_mutex);
+	mutex_unlock(&psock->work_mutex);
+
 	cancel_delayed_work_sync(&psock->work);
 	__sk_psock_zap_ingress(psock);
 	mutex_destroy(&psock->work_mutex);
@@ -824,6 +945,19 @@ static void sk_psock_destroy(struct work_struct *work)
 		sock_put(psock->sk_pair);
 	sock_put(psock->sk);
 	kfree(psock);
+}
+
+void psock_aggregator_remove(struct sk_psock *psock)
+{
+	spin_lock_bh(&psock_aggregator.poll_lock);
+	if (psock->on_poll_list) {
+		list_del_init(&psock->poll_node);
+		psock->on_poll_list = false;
+	}
+	spin_unlock_bh(&psock_aggregator.poll_lock);
+
+	mutex_lock(&psock->work_mutex);
+	mutex_unlock(&psock->work_mutex);
 }
 
 void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
@@ -927,10 +1061,11 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
 	}
 
 	skb_queue_tail(&psock_other->ingress_skb, skb);
-	if (!psock_other->is_running && !delayed_work_pending(&psock_other->work))
-		queue_delayed_work(psock_wq, &psock_other->work, 0);
-
 	spin_unlock_bh(&psock_other->ingress_lock);
+
+	if (!psock_other->on_poll_list)
+		psock_aggregator_enqueue(psock_other);
+
 	return 0;
 }
 
@@ -1007,13 +1142,13 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 			spin_lock_bh(&psock->ingress_lock);
 			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 				skb_queue_tail(&psock->ingress_skb, skb);
-				if (!psock->is_running && !delayed_work_pending(&psock->work))
-					queue_delayed_work(psock_wq, &psock->work, 0);
 				err = 0;
 			}
 			spin_unlock_bh(&psock->ingress_lock);
 			if (err < 0)
 				goto out_free;
+			if (!psock->on_poll_list)
+				psock_aggregator_enqueue(psock);
 		}
 		break;
 	case __SK_REDIRECT:
@@ -1039,9 +1174,9 @@ static void sk_psock_write_space(struct sock *sk)
 	rcu_read_lock();
 	psock = sk_psock(sk);
 	if (likely(psock)) {
-		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)
-		    && !delayed_work_pending(&psock->work) && !psock->is_running)
-			queue_delayed_work(psock_wq, &psock->work, 0);
+		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED) &&
+		    !psock->on_poll_list)
+			psock_aggregator_enqueue(psock);
 
 		write_space = psock->saved_write_space;
 	}
@@ -1260,6 +1395,10 @@ int __init psock_init(void)
 	psock_wq = alloc_workqueue("psock-wq", wq_flags, 0);
 	if (!psock_wq)
 		return -ENOMEM;
+
+	INIT_LIST_HEAD(&psock_aggregator.poll_list);
+	spin_lock_init(&psock_aggregator.poll_lock);
+	INIT_WORK(&psock_aggregator.work, psock_aggregator_work_fn);
 
 	return 0;
 }

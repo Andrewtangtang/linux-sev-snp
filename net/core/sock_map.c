@@ -1682,6 +1682,7 @@ void sock_map_close(struct sock *sk, long timeout)
 		rcu_read_unlock();
 		sk_psock_stop(psock);
 		release_sock(sk);
+		psock_aggregator_remove(psock);
 		cancel_delayed_work_sync(&psock->work);
 		sk_psock_put(sk, psock);
 	} else {
