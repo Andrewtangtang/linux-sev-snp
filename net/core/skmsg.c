@@ -4,6 +4,8 @@
 #include <linux/skmsg.h>
 #include <linux/skbuff.h>
 #include <linux/scatterlist.h>
+#include <linux/sched/clock.h>
+#include <linux/moduleparam.h>
 
 #include <net/sock.h>
 #include <net/tcp.h>
@@ -12,6 +14,12 @@
 
 static struct workqueue_struct *psock_wq;
 
+static unsigned int psock_busy_poll_us;
+core_param(psock_busy_poll_us, psock_busy_poll_us, uint, 0644);
+
+static int aggregator_cpu = -1;
+core_param(aggregator_cpu, aggregator_cpu, int, 0644);
+
 static struct {
 	struct list_head	poll_list;
 	spinlock_t		poll_lock;
@@ -19,6 +27,18 @@ static struct {
 } psock_aggregator;
 
 static void psock_aggregator_work_fn(struct work_struct *work);
+
+static inline unsigned long psock_busy_clock(void)
+{
+	return local_clock() >> 10;
+}
+
+static bool psock_can_busy_poll(unsigned long endtime)
+{
+	return likely(!need_resched() &&
+		      !time_after(psock_busy_clock(), endtime) &&
+		      !signal_pending(current));
+}
 
 static void psock_aggregator_enqueue(struct sk_psock *psock)
 {
@@ -29,7 +49,12 @@ static void psock_aggregator_enqueue(struct sk_psock *psock)
 		psock->on_poll_list = true;
 	}
 	spin_unlock_bh(&psock_aggregator.poll_lock);
-	queue_work(psock_wq, &psock_aggregator.work);
+
+	if (aggregator_cpu >= 0)
+		queue_work_on(aggregator_cpu, psock_wq,
+			      &psock_aggregator.work);
+	else
+		queue_work(psock_wq, &psock_aggregator.work);
 }
 
 static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
@@ -718,7 +743,7 @@ static void sk_psock_backlog(struct work_struct *work)
 	mutex_unlock(&psock->work_mutex);
 }
 
-#define PSOCK_AGG_BUDGET_PER	16
+#define PSOCK_AGG_BUDGET_PER	64
 #define PSOCK_AGG_BUDGET_TOTAL	256
 
 static struct sk_psock *aggregator_pick_next(void)
@@ -744,6 +769,7 @@ static void psock_aggregator_work_fn(struct work_struct *work)
 	struct sk_psock *psock;
 	int total = 0;
 
+process_next:
 	while ((psock = aggregator_pick_next()) != NULL) {
 		bool requeue = false;
 
@@ -792,8 +818,23 @@ put:
 		sk_psock_put(psock->sk, psock);
 
 		if (++total >= PSOCK_AGG_BUDGET_TOTAL) {
-			queue_work(psock_wq, &psock_aggregator.work);
+			if (aggregator_cpu >= 0)
+				queue_work_on(aggregator_cpu, psock_wq,
+					      &psock_aggregator.work);
+			else
+				queue_work(psock_wq,
+					   &psock_aggregator.work);
 			return;
+		}
+	}
+
+	if (psock_busy_poll_us) {
+		unsigned long endtime = psock_busy_clock() + psock_busy_poll_us;
+
+		while (psock_can_busy_poll(endtime)) {
+			if (!list_empty_careful(&psock_aggregator.poll_list))
+				goto process_next;
+			cpu_relax();
 		}
 	}
 }
