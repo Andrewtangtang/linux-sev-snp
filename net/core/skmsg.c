@@ -6,6 +6,7 @@
 #include <linux/scatterlist.h>
 #include <linux/sched/clock.h>
 #include <linux/moduleparam.h>
+#include <linux/kthread.h>
 
 #include <net/sock.h>
 #include <net/tcp.h>
@@ -14,8 +15,8 @@
 
 static struct workqueue_struct *psock_wq;
 
-static unsigned int psock_busy_poll_us;
-core_param(psock_busy_poll_us, psock_busy_poll_us, uint, 0644);
+static unsigned int aggregator_busy_poll_us;
+core_param(aggregator_busy_poll_us, aggregator_busy_poll_us, uint, 0644);
 
 static int aggregator_cpu = -1;
 core_param(aggregator_cpu, aggregator_cpu, int, 0644);
@@ -23,10 +24,8 @@ core_param(aggregator_cpu, aggregator_cpu, int, 0644);
 static struct {
 	struct list_head	poll_list;
 	spinlock_t		poll_lock;
-	struct work_struct	work;
+	struct task_struct	*thread;
 } psock_aggregator;
-
-static void psock_aggregator_work_fn(struct work_struct *work);
 
 static inline unsigned long psock_busy_clock(void)
 {
@@ -50,11 +49,8 @@ static void psock_aggregator_enqueue(struct sk_psock *psock)
 	}
 	spin_unlock_bh(&psock_aggregator.poll_lock);
 
-	if (aggregator_cpu >= 0)
-		queue_work_on(aggregator_cpu, psock_wq,
-			      &psock_aggregator.work);
-	else
-		queue_work(psock_wq, &psock_aggregator.work);
+	if (psock_aggregator.thread)
+		wake_up_process(psock_aggregator.thread);
 }
 
 static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
@@ -764,79 +760,80 @@ static struct sk_psock *aggregator_pick_next(void)
 	return psock;
 }
 
-static void psock_aggregator_work_fn(struct work_struct *work)
+static int psock_aggregator_thread_fn(void *data)
 {
 	struct sk_psock *psock;
-	int total = 0;
+	int total;
 
-process_next:
-	while ((psock = aggregator_pick_next()) != NULL) {
-		bool requeue = false;
+	while (!kthread_should_stop()) {
+		total = 0;
 
-		if (!mutex_trylock(&psock->work_mutex)) {
-			requeue = true;
-			goto put;
-		}
+		while ((psock = aggregator_pick_next()) != NULL) {
+			bool requeue = false;
 
-		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
-			psock->is_running = true;
-			requeue = __sk_psock_backlog_process(psock,
-						PSOCK_AGG_BUDGET_PER);
-			psock->is_running = false;
-		}
+			if (!mutex_trylock(&psock->work_mutex)) {
+				requeue = true;
+				goto put;
+			}
 
-		mutex_unlock(&psock->work_mutex);
+			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+				psock->is_running = true;
+				requeue = __sk_psock_backlog_process(psock,
+							PSOCK_AGG_BUDGET_PER);
+				psock->is_running = false;
+			}
+
+			mutex_unlock(&psock->work_mutex);
 put:
-		spin_lock_bh(&psock_aggregator.poll_lock);
-		if (requeue &&
-		    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
-			list_add_tail(&psock->poll_node,
-				      &psock_aggregator.poll_list);
-		} else {
-			psock->on_poll_list = false;
-			/* Ensure on_poll_list=false is visible to other
-			 * CPUs before we re-check ingress_skb.  Pairs
-			 * with the implicit barrier in skb_queue_tail's
-			 * spinlock release on the softirq side.
-			 */
-			smp_mb();
-			/* Re-check: a softirq may have enqueued an skb
-			 * between our last skb_peek returning NULL and
-			 * setting on_poll_list = false.  The softirq saw
-			 * on_poll_list == true and skipped the enqueue
-			 * call, so we must catch it here.
-			 */
-			if (!skb_queue_empty_lockless(&psock->ingress_skb) &&
+			spin_lock_bh(&psock_aggregator.poll_lock);
+			if (requeue &&
 			    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 				list_add_tail(&psock->poll_node,
 					      &psock_aggregator.poll_list);
-				psock->on_poll_list = true;
+			} else {
+				psock->on_poll_list = false;
+				smp_mb();
+				if (!skb_queue_empty_lockless(&psock->ingress_skb) &&
+				    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
+					list_add_tail(&psock->poll_node,
+						      &psock_aggregator.poll_list);
+					psock->on_poll_list = true;
+				}
+			}
+			spin_unlock_bh(&psock_aggregator.poll_lock);
+
+			sk_psock_put(psock->sk, psock);
+
+			if (++total >= PSOCK_AGG_BUDGET_TOTAL) {
+				cond_resched();
+				total = 0;
 			}
 		}
-		spin_unlock_bh(&psock_aggregator.poll_lock);
 
-		sk_psock_put(psock->sk, psock);
+		/* Busy poll before sleeping */
+		if (aggregator_busy_poll_us) {
+			unsigned long endtime;
 
-		if (++total >= PSOCK_AGG_BUDGET_TOTAL) {
-			if (aggregator_cpu >= 0)
-				queue_work_on(aggregator_cpu, psock_wq,
-					      &psock_aggregator.work);
-			else
-				queue_work(psock_wq,
-					   &psock_aggregator.work);
-			return;
-		}
-	}
-
-	if (psock_busy_poll_us) {
-		unsigned long endtime = psock_busy_clock() + psock_busy_poll_us;
-
-		while (psock_can_busy_poll(endtime)) {
+			endtime = psock_busy_clock() + aggregator_busy_poll_us;
+			while (psock_can_busy_poll(endtime)) {
+				if (!list_empty_careful(
+						&psock_aggregator.poll_list))
+					break;
+				cpu_relax();
+			}
 			if (!list_empty_careful(&psock_aggregator.poll_list))
-				goto process_next;
-			cpu_relax();
+				continue;
 		}
+
+		/* Sleep until woken by softirq */
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (list_empty_careful(&psock_aggregator.poll_list) &&
+		    !kthread_should_stop())
+			schedule();
+		__set_current_state(TASK_RUNNING);
 	}
+
+	return 0;
 }
 
 struct sk_psock *sk_psock_init(struct sock *sk, int node)
@@ -1439,7 +1436,17 @@ int __init psock_init(void)
 
 	INIT_LIST_HEAD(&psock_aggregator.poll_list);
 	spin_lock_init(&psock_aggregator.poll_lock);
-	INIT_WORK(&psock_aggregator.work, psock_aggregator_work_fn);
+
+	psock_aggregator.thread = kthread_run(psock_aggregator_thread_fn,
+					      NULL, "psock-agg");
+	if (IS_ERR(psock_aggregator.thread)) {
+		destroy_workqueue(psock_wq);
+		return PTR_ERR(psock_aggregator.thread);
+	}
+	set_user_nice(psock_aggregator.thread, MIN_NICE);
+	if (aggregator_cpu >= 0)
+		set_cpus_allowed_ptr(psock_aggregator.thread,
+				     cpumask_of(aggregator_cpu));
 
 	return 0;
 }
