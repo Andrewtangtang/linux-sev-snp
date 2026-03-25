@@ -18,14 +18,13 @@ static struct workqueue_struct *psock_wq;
 static unsigned int aggregator_busy_poll_us;
 core_param(aggregator_busy_poll_us, aggregator_busy_poll_us, uint, 0644);
 
-static int aggregator_cpu = -1;
-core_param(aggregator_cpu, aggregator_cpu, int, 0644);
-
-static struct {
+struct psock_aggregator {
 	struct list_head	poll_list;
 	spinlock_t		poll_lock;
 	struct task_struct	*thread;
-} psock_aggregator;
+};
+
+static DEFINE_PER_CPU(struct psock_aggregator, psock_aggregators);
 
 static inline unsigned long psock_busy_clock(void)
 {
@@ -41,16 +40,22 @@ static bool psock_can_busy_poll(unsigned long endtime)
 
 static void psock_aggregator_enqueue(struct sk_psock *psock)
 {
-	spin_lock_bh(&psock_aggregator.poll_lock);
+	struct psock_aggregator *agg;
+
+	if (READ_ONCE(psock->home_cpu) < 0)
+		cmpxchg(&psock->home_cpu, -1, raw_smp_processor_id());
+
+	agg = per_cpu_ptr(&psock_aggregators, READ_ONCE(psock->home_cpu));
+
+	spin_lock_bh(&agg->poll_lock);
 	if (!psock->on_poll_list) {
-		list_add_tail(&psock->poll_node,
-			      &psock_aggregator.poll_list);
+		list_add_tail(&psock->poll_node, &agg->poll_list);
 		psock->on_poll_list = true;
 	}
-	spin_unlock_bh(&psock_aggregator.poll_lock);
+	spin_unlock_bh(&agg->poll_lock);
 
-	if (psock_aggregator.thread)
-		wake_up_process(psock_aggregator.thread);
+	if (agg->thread)
+		wake_up_process(agg->thread);
 }
 
 static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
@@ -742,13 +747,13 @@ static void sk_psock_backlog(struct work_struct *work)
 #define PSOCK_AGG_BUDGET_PER	64
 #define PSOCK_AGG_BUDGET_TOTAL	256
 
-static struct sk_psock *aggregator_pick_next(void)
+static struct sk_psock *aggregator_pick_next(struct psock_aggregator *agg)
 {
 	struct sk_psock *psock = NULL;
 
-	spin_lock_bh(&psock_aggregator.poll_lock);
-	while (!list_empty(&psock_aggregator.poll_list)) {
-		psock = list_first_entry(&psock_aggregator.poll_list,
+	spin_lock_bh(&agg->poll_lock);
+	while (!list_empty(&agg->poll_list)) {
+		psock = list_first_entry(&agg->poll_list,
 					 struct sk_psock, poll_node);
 		list_del_init(&psock->poll_node);
 		if (refcount_inc_not_zero(&psock->refcnt))
@@ -756,19 +761,21 @@ static struct sk_psock *aggregator_pick_next(void)
 		psock->on_poll_list = false;
 		psock = NULL;
 	}
-	spin_unlock_bh(&psock_aggregator.poll_lock);
+	spin_unlock_bh(&agg->poll_lock);
 	return psock;
 }
 
 static int psock_aggregator_thread_fn(void *data)
 {
+	int cpu = (long)data;
+	struct psock_aggregator *agg = per_cpu_ptr(&psock_aggregators, cpu);
 	struct sk_psock *psock;
 	int total;
 
 	while (!kthread_should_stop()) {
 		total = 0;
 
-		while ((psock = aggregator_pick_next()) != NULL) {
+		while ((psock = aggregator_pick_next(agg)) != NULL) {
 			bool requeue = false;
 
 			if (!mutex_trylock(&psock->work_mutex)) {
@@ -785,22 +792,22 @@ static int psock_aggregator_thread_fn(void *data)
 
 			mutex_unlock(&psock->work_mutex);
 put:
-			spin_lock_bh(&psock_aggregator.poll_lock);
+			spin_lock_bh(&agg->poll_lock);
 			if (requeue &&
 			    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 				list_add_tail(&psock->poll_node,
-					      &psock_aggregator.poll_list);
+					      &agg->poll_list);
 			} else {
 				psock->on_poll_list = false;
 				smp_mb();
 				if (!skb_queue_empty_lockless(&psock->ingress_skb) &&
 				    sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 					list_add_tail(&psock->poll_node,
-						      &psock_aggregator.poll_list);
+						      &agg->poll_list);
 					psock->on_poll_list = true;
 				}
 			}
-			spin_unlock_bh(&psock_aggregator.poll_lock);
+			spin_unlock_bh(&agg->poll_lock);
 
 			sk_psock_put(psock->sk, psock);
 
@@ -810,24 +817,21 @@ put:
 			}
 		}
 
-		/* Busy poll before sleeping */
 		if (aggregator_busy_poll_us) {
 			unsigned long endtime;
 
 			endtime = psock_busy_clock() + aggregator_busy_poll_us;
 			while (psock_can_busy_poll(endtime)) {
-				if (!list_empty_careful(
-						&psock_aggregator.poll_list))
+				if (!list_empty_careful(&agg->poll_list))
 					break;
 				cpu_relax();
 			}
-			if (!list_empty_careful(&psock_aggregator.poll_list))
+			if (!list_empty_careful(&agg->poll_list))
 				continue;
 		}
 
-		/* Sleep until woken by softirq */
 		set_current_state(TASK_INTERRUPTIBLE);
-		if (list_empty_careful(&psock_aggregator.poll_list) &&
+		if (list_empty_careful(&agg->poll_list) &&
 		    !kthread_should_stop())
 			schedule();
 		__set_current_state(TASK_RUNNING);
@@ -877,6 +881,7 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 	spin_lock_init(&psock->ingress_lock);
 	INIT_LIST_HEAD(&psock->poll_node);
 	psock->on_poll_list = false;
+	psock->home_cpu = -1;
 	skb_queue_head_init(&psock->ingress_skb);
 
 	sk_psock_set_state(psock, SK_PSOCK_TX_ENABLED);
@@ -959,12 +964,17 @@ static void sk_psock_destroy(struct work_struct *work)
 	sk_psock_done_strp(psock);
 
 	/* Remove from aggregator poll_list and wait for processing */
-	spin_lock_bh(&psock_aggregator.poll_lock);
-	if (psock->on_poll_list) {
-		list_del_init(&psock->poll_node);
-		psock->on_poll_list = false;
+	if (psock->home_cpu >= 0) {
+		struct psock_aggregator *agg;
+
+		agg = per_cpu_ptr(&psock_aggregators, psock->home_cpu);
+		spin_lock_bh(&agg->poll_lock);
+		if (psock->on_poll_list) {
+			list_del_init(&psock->poll_node);
+			psock->on_poll_list = false;
+		}
+		spin_unlock_bh(&agg->poll_lock);
 	}
-	spin_unlock_bh(&psock_aggregator.poll_lock);
 	mutex_lock(&psock->work_mutex);
 	mutex_unlock(&psock->work_mutex);
 
@@ -987,12 +997,17 @@ static void sk_psock_destroy(struct work_struct *work)
 
 void psock_aggregator_remove(struct sk_psock *psock)
 {
-	spin_lock_bh(&psock_aggregator.poll_lock);
-	if (psock->on_poll_list) {
-		list_del_init(&psock->poll_node);
-		psock->on_poll_list = false;
+	if (psock->home_cpu >= 0) {
+		struct psock_aggregator *agg;
+
+		agg = per_cpu_ptr(&psock_aggregators, psock->home_cpu);
+		spin_lock_bh(&agg->poll_lock);
+		if (psock->on_poll_list) {
+			list_del_init(&psock->poll_node);
+			psock->on_poll_list = false;
+		}
+		spin_unlock_bh(&agg->poll_lock);
 	}
-	spin_unlock_bh(&psock_aggregator.poll_lock);
 
 	mutex_lock(&psock->work_mutex);
 	mutex_unlock(&psock->work_mutex);
@@ -1434,19 +1449,36 @@ int __init psock_init(void)
 	if (!psock_wq)
 		return -ENOMEM;
 
-	INIT_LIST_HEAD(&psock_aggregator.poll_list);
-	spin_lock_init(&psock_aggregator.poll_lock);
+	{
+		int cpu;
 
-	psock_aggregator.thread = kthread_run(psock_aggregator_thread_fn,
-					      NULL, "psock-agg");
-	if (IS_ERR(psock_aggregator.thread)) {
-		destroy_workqueue(psock_wq);
-		return PTR_ERR(psock_aggregator.thread);
+		for_each_possible_cpu(cpu) {
+			struct psock_aggregator *agg;
+
+			agg = per_cpu_ptr(&psock_aggregators, cpu);
+			INIT_LIST_HEAD(&agg->poll_list);
+			spin_lock_init(&agg->poll_lock);
+			agg->thread = NULL;
+		}
+
+		for_each_online_cpu(cpu) {
+			struct psock_aggregator *agg;
+			struct task_struct *t;
+
+			agg = per_cpu_ptr(&psock_aggregators, cpu);
+			t = kthread_create(psock_aggregator_thread_fn,
+					   (void *)(long)cpu,
+					   "psock-agg/%d", cpu);
+			if (IS_ERR(t)) {
+				destroy_workqueue(psock_wq);
+				return PTR_ERR(t);
+			}
+			kthread_bind(t, cpu);
+			set_user_nice(t, MIN_NICE);
+			wake_up_process(t);
+			agg->thread = t;
+		}
 	}
-	set_user_nice(psock_aggregator.thread, MIN_NICE);
-	if (aggregator_cpu >= 0)
-		set_cpus_allowed_ptr(psock_aggregator.thread,
-				     cpumask_of(aggregator_cpu));
 
 	return 0;
 }

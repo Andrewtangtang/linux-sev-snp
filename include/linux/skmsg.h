@@ -120,6 +120,7 @@ struct sk_psock {
 	bool				is_running;
 	struct list_head		poll_node;
 	bool				on_poll_list;
+	int				home_cpu;
 };
 
 void psock_aggregator_remove(struct sk_psock *psock);
