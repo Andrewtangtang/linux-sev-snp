@@ -668,7 +668,7 @@ static void sk_psock_backlog(struct work_struct *work)
 					if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 						if (delayed_work_pending(&psock->work))
 							goto end;
-						queue_delayed_work(psock_wq, &psock->work, 0);
+						queue_delayed_work_on(smp_processor_id(), psock_wq, &psock->work, 0);
 					}
 					goto end;
 				}
@@ -928,7 +928,7 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
 
 	skb_queue_tail(&psock_other->ingress_skb, skb);
 	if (!psock_other->is_running && !delayed_work_pending(&psock_other->work))
-		queue_delayed_work(psock_wq, &psock_other->work, 0);
+		queue_delayed_work_on(smp_processor_id(), psock_wq, &psock_other->work, 0);
 
 	spin_unlock_bh(&psock_other->ingress_lock);
 	return 0;
@@ -1008,7 +1008,7 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 				skb_queue_tail(&psock->ingress_skb, skb);
 				if (!psock->is_running && !delayed_work_pending(&psock->work))
-					queue_delayed_work(psock_wq, &psock->work, 0);
+					queue_delayed_work_on(smp_processor_id(), psock_wq, &psock->work, 0);
 				err = 0;
 			}
 			spin_unlock_bh(&psock->ingress_lock);
@@ -1041,7 +1041,7 @@ static void sk_psock_write_space(struct sock *sk)
 	if (likely(psock)) {
 		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)
 		    && !delayed_work_pending(&psock->work) && !psock->is_running)
-			queue_delayed_work(psock_wq, &psock->work, 0);
+			queue_delayed_work_on(smp_processor_id(), psock_wq, &psock->work, 0);
 
 		write_space = psock->saved_write_space;
 	}
@@ -1255,7 +1255,7 @@ void sk_psock_stop_verdict(struct sock *sk, struct sk_psock *psock)
 
 int __init psock_init(void)
 {
-	unsigned int wq_flags = WQ_UNBOUND | WQ_SYSFS | WQ_HIGHPRI;
+	unsigned int wq_flags = WQ_SYSFS | WQ_HIGHPRI;
 
 	psock_wq = alloc_workqueue("psock-wq", wq_flags, 0);
 	if (!psock_wq)
