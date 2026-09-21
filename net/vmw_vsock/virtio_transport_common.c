@@ -1625,6 +1625,8 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 			goto free_pkt;
 		}
 	}
+	sk->sk_num = dst.svm_port;
+	sk->sk_dport = src.svm_port;
 
 	if (virtio_transport_get_type(sk) != le16_to_cpu(hdr->type)) {
 		(void)virtio_transport_reset_no_sock(t, skb);
