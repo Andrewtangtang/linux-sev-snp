@@ -21,6 +21,10 @@
 #include <linux/mutex.h>
 #include <net/af_vsock.h>
 
+static unsigned virtio_vsock_rx_buf_size = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
+module_param(virtio_vsock_rx_buf_size, uint, 0664);
+MODULE_PARM_DESC(virtio_vsock_rx_buf_size, "Adjust rx buf size");
+
 static struct workqueue_struct *virtio_vsock_workqueue;
 static struct virtio_vsock __rcu *the_virtio_vsock;
 static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
@@ -372,7 +376,7 @@ static void virtio_vsock_rx_fill(struct rx_queue *rq)
 			phys_addr_t phys;
 
 			phys = swiotlb_map(NULL, INVALID_PHYS_ADDR,
-					   VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE, DMA_NONE, 0);
+					   virtio_vsock_rx_buf_size, DMA_NONE, 0);
 			if (phys == DMA_MAPPING_ERROR) {
 				kfree_skb(skb);
 				break;
@@ -380,7 +384,7 @@ static void virtio_vsock_rx_fill(struct rx_queue *rq)
 			page = phys_to_page(phys);
 		}
 
-		sg_init_one(&data, page_address(page), VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
+		sg_init_one(&data, page_address(page), virtio_vsock_rx_buf_size);
 		sgs[1] = &data;
 
 		memcpy(&VIRTIO_VSOCK_SKB_CB(skb)->p, &page, sizeof(struct page *));
@@ -736,7 +740,7 @@ static void virtio_transport_rx_work(struct work_struct *work)
 			// virtio_vsock_skb_rx_put(skb);
 			payload_len = le32_to_cpu(virtio_vsock_hdr(skb)->len);
 			skb_add_rx_frag(skb, 0, p, 0, payload_len,
-					VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE);
+					virtio_vsock_rx_buf_size);
 			virtio_transport_deliver_tap_pkt(skb);
 			virtio_transport_recv_pkt(&virtio_transport, skb);
 		}
