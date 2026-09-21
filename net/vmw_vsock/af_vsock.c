@@ -135,8 +135,8 @@ struct proto vsock_proto = {
  */
 #define VSOCK_DEFAULT_CONNECT_TIMEOUT (2 * HZ)
 
-#define VSOCK_DEFAULT_BUFFER_SIZE     (1024 * 256)
-#define VSOCK_DEFAULT_BUFFER_MAX_SIZE (1024 * 256)
+#define VSOCK_DEFAULT_BUFFER_SIZE     (1024 * 1024 * 2)
+#define VSOCK_DEFAULT_BUFFER_MAX_SIZE (1024 * 1024 * 2)
 #define VSOCK_DEFAULT_BUFFER_MIN_SIZE 128
 
 /* Transport used for host->guest communication */
