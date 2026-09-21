@@ -1666,6 +1666,7 @@ static int vsock_accept(struct socket *sock, struct socket *newsock,
 			if (vsock_msgzerocopy_allow(vconnected->transport))
 				set_bit(SOCK_SUPPORT_ZC,
 					&connected->sk_socket->flags);
+			set_bit(SOCK_CUSTOM_SOCKOPT, &newsock->flags);
 		}
 
 		release_sock(connected);
