@@ -21,6 +21,10 @@
 #include <linux/mutex.h>
 #include <net/af_vsock.h>
 
+static unsigned virtio_vsock_rx_buf_size = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
+module_param(virtio_vsock_rx_buf_size, uint, 0664);
+MODULE_PARM_DESC(virtio_vsock_rx_buf_size, "Adjust rx buf size");
+
 static struct workqueue_struct *virtio_vsock_workqueue;
 static struct virtio_vsock __rcu *the_virtio_vsock;
 static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
@@ -307,7 +311,7 @@ out_rcu:
 
 static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 {
-	int total_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE + VIRTIO_VSOCK_SKB_HEADROOM;
+	int total_len = virtio_vsock_rx_buf_size + VIRTIO_VSOCK_SKB_HEADROOM;
 	struct scatterlist pkt, *p;
 	struct virtqueue *vq;
 	struct sk_buff *skb;
