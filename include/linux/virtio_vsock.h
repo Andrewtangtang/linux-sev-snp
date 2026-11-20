@@ -124,7 +124,7 @@ static inline bool virtio_vsock_is_same_payload(struct virtio_vsock_hdr *flow_hd
 
 #define VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE	(1024 * 64)
 #define VIRTIO_VSOCK_MAX_BUF_SIZE		0xFFFFFFFFUL
-#define VIRTIO_VSOCK_MAX_PKT_BUF_SIZE		(VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE * 16)
+#define VIRTIO_VSOCK_MAX_PKT_BUF_SIZE		(1024 * 64)
 
 enum {
 	VSOCK_VQ_RX     = 0, /* for host to guest data */
