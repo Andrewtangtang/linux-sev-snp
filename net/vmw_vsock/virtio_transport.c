@@ -311,7 +311,6 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 	struct virtqueue *vq;
 	struct sk_buff *skb;
 	struct page *page;
-	void *hdr_buf;
 	int ret;
 	int frags_flag = (GFP_KERNEL & ~__GFP_DIRECT_RECLAIM) |
 			  __GFP_COMP | __GFP_NOWARN |
@@ -320,10 +319,6 @@ static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
 	vq = vsock->vqs[VSOCK_VQ_RX];
 
 	do {
-		hdr_buf = kmalloc(VIRTIO_VSOCK_SKB_HEADROOM, GFP_KERNEL);
-		if (!hdr_buf)
-			break;
-
 		skb = virtio_vsock_alloc_skb(VIRTIO_VSOCK_SKB_HEADROOM, GFP_KERNEL);
 		if (!skb)
 			break;
